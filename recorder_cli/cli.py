@@ -22,7 +22,6 @@ def main():
 def login():
     """Open browser for Google authentication."""
     console.print("Opening browser for Google login...")
-    console.print("Sign in to your Google account, then close the browser when done.")
     asyncio.run(browser_login())
     console.print("[green]Session saved successfully.[/green]")
 

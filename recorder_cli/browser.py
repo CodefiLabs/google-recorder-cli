@@ -17,9 +17,12 @@ async def login() -> None:
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto(RECORDER_URL)
-        # Wait for user to complete login — detect by URL returning to recorder
-        await page.wait_for_url(f"{RECORDER_URL}/**", timeout=300_000)
-        await page.wait_for_load_state("networkidle")
+        # Wait for user to finish signing in, then press Enter in the terminal
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            input,
+            "\nSign in to your Google account in the browser window.\nPress Enter here when you're done...\n",
+        )
         await context.storage_state(path=str(SESSION_FILE))
         await browser.close()
 
