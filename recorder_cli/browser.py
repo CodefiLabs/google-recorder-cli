@@ -45,15 +45,19 @@ async def intercept_response(
     timeout: float = 30_000,
 ) -> dict:
     """Navigate to trigger_url and capture the first JSON response matching url_pattern."""
-    captured: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+    loop = asyncio.get_event_loop()
+    captured: asyncio.Future[dict] = loop.create_future()
 
-    async def on_response(response: Response) -> None:
+    def on_response(response: Response) -> None:
         if url_pattern in response.url and not captured.done():
-            try:
-                data = await response.json()
-                captured.set_result(data)
-            except Exception:
-                pass
+            async def _read():
+                try:
+                    data = await response.json()
+                    if not captured.done():
+                        captured.set_result(data)
+                except Exception:
+                    pass
+            asyncio.ensure_future(_read())
 
     page.on("response", on_response)
     await page.goto(trigger_url)
