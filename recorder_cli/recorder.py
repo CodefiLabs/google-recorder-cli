@@ -1,10 +1,42 @@
-from pathlib import Path
+import asyncio
 from datetime import datetime
+from pathlib import Path
 
 from playwright.async_api import async_playwright
 
-from recorder_cli.browser import create_context, intercept_response, RECORDER_URL
+from recorder_cli.browser import create_context, RECORDER_URL
 from recorder_cli.models import Recording, Transcript, TranscriptSegment
+
+_GRPC_BASE = (
+    "https://pixelrecorder-pa.clients6.google.com"
+    "/$rpc/java.com.google.wireless.android.pixel.recorder.protos.PlaybackService"
+)
+_AUDIO_BASE = "https://usercontent.recorder.google.com/download/playback"
+
+
+def _intercept_grpc(page, endpoint: str) -> asyncio.Future:
+    """
+    Register a one-shot response interceptor for a gRPC endpoint.
+    Returns a Future that resolves with the parsed JSON body of the first matching response.
+    The listener is automatically removed once the future resolves.
+    """
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future = loop.create_future()
+
+    def on_response(response: object) -> None:
+        if endpoint in response.url and not future.done():  # type: ignore[attr-defined]
+            async def _read() -> None:
+                try:
+                    data = await response.json()  # type: ignore[attr-defined]
+                    if not future.done():
+                        future.set_result(data)
+                except Exception:
+                    pass
+            asyncio.ensure_future(_read())
+
+    page.on("response", on_response)
+    future.add_done_callback(lambda _: page.remove_listener("response", on_response))
+    return future
 
 
 class RecorderClient:
@@ -16,26 +48,58 @@ class RecorderClient:
             context = await create_context(p)
             page = await context.new_page()
             try:
-                data = await intercept_response(
-                    page,
-                    url_pattern="recorder",  # TODO: narrow after discovering real URL pattern
-                    trigger_url=RECORDER_URL,
-                )
+                future = _intercept_grpc(page, "GetRecordingList")
+                await page.goto(RECORDER_URL)
+                try:
+                    data = await asyncio.wait_for(asyncio.shield(future), timeout=30)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        "Recorder did not load. Session may be expired. Run: recorder login"
+                    )
                 return self._parse_recordings(data)
             finally:
                 await context.close()
 
     async def get_transcript(self, recording_id: str) -> Transcript:
-        """Fetch transcript for a recording."""
+        """
+        Fetch transcript for a recording.
+
+        The app URLs use audio_id (not recording_id), so we:
+        1. Load the main page to get the recording list (and find audio_id)
+        2. Navigate to RECORDER_URL/{audio_id} which auto-triggers GetTranscription
+        """
         async with async_playwright() as p:
             context = await create_context(p)
             page = await context.new_page()
             try:
-                data = await intercept_response(
-                    page,
-                    url_pattern="transcript",  # TODO: narrow after discovering real URL pattern
-                    trigger_url=f"{RECORDER_URL}/{recording_id}",
-                )
+                # Step 1: get recording list to find audio_id
+                list_future = _intercept_grpc(page, "GetRecordingList")
+                await page.goto(RECORDER_URL)
+                try:
+                    list_data = await asyncio.wait_for(asyncio.shield(list_future), timeout=30)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        "Recorder did not load. Session may be expired. Run: recorder login"
+                    )
+
+                audio_id = None
+                for item in list_data[0]:
+                    if item[0] == recording_id:
+                        audio_id = item[13]
+                        break
+                if not audio_id:
+                    raise ValueError(f"Recording not found: {recording_id}")
+
+                # Step 2: navigate to the recording URL to trigger GetTranscription
+                trans_future = _intercept_grpc(page, "GetTranscription")
+                await page.goto(f"{RECORDER_URL}/{audio_id}")
+                try:
+                    data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        f"Transcript not available for {recording_id}. "
+                        "The recording may not have a transcript yet."
+                    )
                 return self._parse_transcript(recording_id, data)
             finally:
                 await context.close()
@@ -46,20 +110,34 @@ class RecorderClient:
             context = await create_context(p)
             page = await context.new_page()
             try:
-                data = await intercept_response(
-                    page,
-                    url_pattern="audio",  # TODO: narrow after discovering real URL pattern
-                    trigger_url=f"{RECORDER_URL}/{recording_id}",
-                )
-                # TODO: Extract audio URL from response and download
-                # Audio URLs may be signed and expire quickly
-                audio_url = data.get("url", "")
-                info = await self.get_recording_info(recording_id)
-                filename = f"{info.title}.m4a"
-                filepath = output_path / filename
+                # Get recording list to find audio_id and title
+                list_future = _intercept_grpc(page, "GetRecordingList")
+                await page.goto(RECORDER_URL)
+                try:
+                    list_data = await asyncio.wait_for(asyncio.shield(list_future), timeout=30)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        "Recorder did not load. Session may be expired. Run: recorder login"
+                    )
 
-                response = await page.request.get(audio_url)
-                filepath.parent.mkdir(parents=True, exist_ok=True)
+                audio_id = None
+                title = recording_id
+                for item in list_data[0]:
+                    if item[0] == recording_id:
+                        audio_id = item[13]
+                        title = item[1]
+                        break
+                if not audio_id:
+                    raise ValueError(f"Recording not found: {recording_id}")
+
+                url = f"{_AUDIO_BASE}/{audio_id}"
+                response = await page.request.get(url)
+                if not response.ok:
+                    raise RuntimeError(f"Failed to download audio: HTTP {response.status}")
+
+                safe_title = "".join(c if c.isalnum() or c in " .-_" else "_" for c in title)
+                filepath = output_path / f"{safe_title}.m4a"
+                output_path.mkdir(parents=True, exist_ok=True)
                 filepath.write_bytes(await response.body())
                 return filepath
             finally:
@@ -88,13 +166,16 @@ class RecorderClient:
         audio_dir.mkdir(exist_ok=True)
 
         recordings = await self.list_recordings()
-        results = {"transcripts": [], "audio": [], "errors": []}
+        results: dict = {"transcripts": [], "audio": [], "errors": []}
 
         for rec in recordings:
             try:
                 if rec.has_transcript:
                     transcript = await self.get_transcript(rec.id)
-                    txt_path = transcripts_dir / f"{rec.title}.txt"
+                    safe_title = "".join(
+                        c if c.isalnum() or c in " .-_" else "_" for c in rec.title
+                    )
+                    txt_path = transcripts_dir / f"{safe_title}.txt"
                     txt_path.write_text(transcript.full_text)
                     results["transcripts"].append(str(txt_path))
             except Exception as e:
@@ -108,49 +189,60 @@ class RecorderClient:
 
         return results
 
-    def _parse_recordings(self, data: dict) -> list[Recording]:
-        """Parse raw API response into Recording objects.
+    def _parse_recordings(self, data: list) -> list[Recording]:
+        """Parse GetRecordingList response.
 
-        TODO: Update parsing once real API payload shape is known.
+        Response format: [[recording, ...], pagination_cursor]
+        Each recording: [id, title, [created_sec_str, ns], [dur_sec_str, ns], lat, lng,
+                         location, null, audio_info, tags, transcript_segments, ..., audio_id, ...]
         """
         recordings = []
-        items = data if isinstance(data, list) else data.get("recordings", data.get("items", []))
+        try:
+            items = data[0]
+        except (IndexError, TypeError):
+            return recordings
+
         for item in items:
             try:
                 recordings.append(Recording(
-                    id=str(item.get("id", item.get("recording_id", ""))),
-                    title=str(item.get("title", item.get("name", "Untitled"))),
-                    created_at=datetime.fromisoformat(
-                        item.get("created_at", item.get("create_time", "2000-01-01"))
-                    ),
-                    duration_seconds=int(item.get("duration_seconds", item.get("duration", 0))),
-                    has_transcript=bool(item.get("has_transcript", item.get("transcript_available", False))),
+                    id=str(item[0]),
+                    title=str(item[1]),
+                    created_at=datetime.fromtimestamp(int(item[2][0])),
+                    duration_seconds=int(item[3][0]),
+                    has_transcript=bool(item[10]),
+                    audio_id=str(item[13]) if item[13] else "",
                 ))
-            except (KeyError, ValueError, TypeError):
+            except (IndexError, TypeError, ValueError):
                 continue
         return recordings
 
-    def _parse_transcript(self, recording_id: str, data: dict) -> Transcript:
-        """Parse raw API response into Transcript.
+    def _parse_transcript(self, recording_id: str, data: list) -> Transcript:
+        """Parse GetTranscription response.
 
-        TODO: Update parsing once real API payload shape is known.
+        Response format: [[[segment, ...], ...]]
+        Each segment: [sentence, ...]
+        Each sentence: [word, ...]
+        Each word: [text, alt_display_text, start_ms_str, end_ms_str, ?, ?, [speaker_flags]]
         """
-        full_text = data.get("text", data.get("transcript", ""))
-        raw_segments = data.get("segments", data.get("results", []))
         segments = []
-        for seg in raw_segments:
-            try:
-                segments.append(TranscriptSegment(
-                    timestamp_seconds=float(seg.get("timestamp", seg.get("start_time", 0))),
-                    speaker=seg.get("speaker", None),
-                    text=str(seg.get("text", seg.get("content", ""))),
-                ))
-            except (KeyError, ValueError, TypeError):
-                continue
+        try:
+            for segment in data[0]:
+                for sentence in segment:
+                    for word in sentence:
+                        try:
+                            text = str(word[0])
+                            start_ms = int(word[2])
+                            segments.append(TranscriptSegment(
+                                timestamp_seconds=start_ms / 1000.0,
+                                speaker=None,
+                                text=text,
+                            ))
+                        except (IndexError, TypeError, ValueError):
+                            continue
+        except (IndexError, TypeError):
+            pass
 
-        if not full_text and segments:
-            full_text = "\n".join(s.text for s in segments)
-
+        full_text = " ".join(s.text for s in segments).strip()
         return Transcript(
             recording_id=recording_id,
             full_text=full_text,

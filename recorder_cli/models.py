@@ -9,6 +9,7 @@ class Recording:
     created_at: datetime
     duration_seconds: int
     has_transcript: bool
+    audio_id: str = ""  # internal ID used by download/transcript APIs (field [13] in API response)
 
 
 @dataclass
