@@ -60,6 +60,16 @@ recorder mcp serve --transport http --port 8420
 
 **Tools:** `list_recordings`, `get_transcript`, `download_audio`, `get_recording_info`, `search_recordings`
 
+### Claude Code Skill
+
+Installs a `SKILL.md` at `~/.claude/skills/google-recorder-cli/` so Claude Code knows when and how to use this CLI — the login prerequisite, command reference, and gotchas like silently truncated live transcripts.
+
+```bash
+recorder skill install     # idempotent; backs up a locally-edited copy before overwriting
+recorder skill status      # installed / not installed / differs from the bundled version
+recorder skill uninstall   # idempotent
+```
+
 ## How It Works
 
 Uses Playwright to load recorder.google.com and intercept JSON responses from the page's internal API calls. No API reverse-engineering required — the tool captures structured data directly from network traffic.

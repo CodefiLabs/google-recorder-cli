@@ -20,3 +20,7 @@ def test_import_mcp():
 
 def test_import_mcp_setup():
     from recorder_cli.mcp_setup import CLIENTS
+
+
+def test_import_skill_setup():
+    from recorder_cli.skill_setup import install, uninstall, status

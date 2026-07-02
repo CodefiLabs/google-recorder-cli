@@ -1,6 +1,6 @@
 [project]
 name = "google-recorder-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Unofficial CLI and MCP server for Google Recorder (recorder.google.com)"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -9,6 +9,7 @@ from rich.table import Table
 from recorder_cli.browser import login as browser_login, has_session
 from recorder_cli.mcp_setup import CLIENTS
 from recorder_cli.recorder import RecorderClient
+from recorder_cli import skill_setup
 
 console = Console()
 
@@ -60,6 +61,30 @@ def mcp_serve(transport, host, port):
     from recorder_cli.mcp_server import run_server  # deferred: fastmcp import is heavy
 
     run_server(transport, host, port)
+
+
+@main.group()
+def skill():
+    """Manage the google-recorder-cli Claude Code skill."""
+    pass
+
+
+@skill.command("install")
+def skill_install():
+    """Install the skill into ~/.claude/skills/ (idempotent)."""
+    skill_setup.install()
+
+
+@skill.command("uninstall")
+def skill_uninstall():
+    """Remove the skill from ~/.claude/skills/ (idempotent)."""
+    skill_setup.uninstall()
+
+
+@skill.command("status")
+def skill_status():
+    """Show whether the skill is installed and up to date."""
+    skill_setup.status()
 
 
 @main.command()
