@@ -13,9 +13,10 @@ List recordings, copy transcripts, download audio, and access recording metadata
 ## Installation
 
 ```bash
-pip install -e .
-playwright install chromium
+pipx install .   # or: pip install -e .
 ```
+
+Requires Google Chrome — the tool drives your real Chrome (via Playwright's `channel="chrome"`), so `playwright install chromium` is not needed and not sufficient.
 
 ## Usage
 
@@ -25,7 +26,7 @@ playwright install chromium
 recorder login
 ```
 
-Opens a Chrome window. Sign into your Google account. The session is saved to `~/.recorder-cli/session.json` and persists for several weeks.
+Opens a Chrome window. Sign into your Google account. The session is saved as a browser profile under `~/.recorder-cli/chrome-profile/` and persists for several weeks.
 
 ### CLI Commands
 
@@ -42,20 +43,19 @@ recorder sync -o ~/recorder-backup/    # Bulk download everything
 
 ### MCP Server
 
+Register with a local client (idempotent; `uninstall` reverses it):
+
 ```bash
-recorder-mcp
+recorder mcp install claude-desktop   # patches claude_desktop_config.json, backs up first
+recorder mcp install claude-code      # delegates to `claude mcp add` (user scope)
+recorder mcp status                   # show registration state for both clients
 ```
 
-Configure in Claude Desktop:
+Registrations point at the `recorder-mcp` binary, which speaks stdio by default. To serve over the network instead (bearer-token auth, loopback bind — exposing it beyond that is deliberately left to you):
 
-```json
-{
-  "mcpServers": {
-    "google-recorder": {
-      "command": "recorder-mcp"
-    }
-  }
-}
+```bash
+recorder mcp serve --transport http --port 8420
+# token is generated once and stored at ~/.recorder-cli/mcp_token (never printed)
 ```
 
 **Tools:** `list_recordings`, `get_transcript`, `download_audio`, `get_recording_info`, `search_recordings`

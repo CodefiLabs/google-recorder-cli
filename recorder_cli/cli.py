@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from recorder_cli.browser import login as browser_login, has_session
+from recorder_cli.mcp_setup import CLIENTS
 from recorder_cli.recorder import RecorderClient
 
 console = Console()
@@ -16,6 +17,49 @@ console = Console()
 def main():
     """Unofficial CLI for Google Recorder (recorder.google.com)."""
     pass
+
+
+@main.group()
+def mcp():
+    """Manage the recorder MCP server and its client registrations."""
+    pass
+
+
+@mcp.command("install")
+@click.argument("client", type=click.Choice(sorted(CLIENTS)))
+def mcp_install(client):
+    """Register recorder-mcp with CLIENT (idempotent)."""
+    CLIENTS[client].install()
+
+
+@mcp.command("uninstall")
+@click.argument("client", type=click.Choice(sorted(CLIENTS)))
+def mcp_uninstall(client):
+    """Remove the recorder-mcp registration from CLIENT (idempotent)."""
+    CLIENTS[client].uninstall()
+
+
+@mcp.command("status")
+def mcp_status():
+    """Show recorder-mcp registration status for all supported clients."""
+    for name in sorted(CLIENTS):
+        CLIENTS[name].status()
+
+
+@mcp.command("serve")
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"]),
+    default="stdio",
+    help="stdio for local clients (what registrations use); http to serve over the network.",
+)
+@click.option("--host", default="127.0.0.1", help="Bind address for --transport http.")
+@click.option("--port", default=8420, type=int, help="Bind port for --transport http.")
+def mcp_serve(transport, host, port):
+    """Run the MCP server (equivalent to the recorder-mcp binary)."""
+    from recorder_cli.mcp_server import run_server  # deferred: fastmcp import is heavy
+
+    run_server(transport, host, port)
 
 
 @main.command()

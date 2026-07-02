@@ -15,4 +15,8 @@ def test_import_cli():
 
 
 def test_import_mcp():
-    from recorder_cli.mcp_server import mcp, main
+    from recorder_cli.mcp_server import mcp, main, run_server
+
+
+def test_import_mcp_setup():
+    from recorder_cli.mcp_setup import CLIENTS
