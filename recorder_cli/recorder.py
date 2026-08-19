@@ -62,18 +62,23 @@ class RecorderClient:
 
     async def get_transcript(self, recording_id: str) -> Transcript:
         """
-        Fetch transcript for a recording.
+        Fetch the official full transcript for a recording.
 
-        CURRENT STATE: The web UI's Download button creates a client-side blob from
-        data fetched via an in-page RPC (not a static file URL). We need to identify
-        which PlaybackService RPC provides the formatted official transcript text that
-        includes speaker labels like [Speaker 1] and the "Transcribed by Pixel" footer.
+        This method intercepts the GetTranscription gRPC response (447KB for a 73-min recording)
+        and reconstructs the official speaker-labeled Pixel transcript format that matches
+        what the web UI's Download button produces (50KB text file with speaker labels).
 
-        The live caption from GetTranscription truncates on long recordings. The official
-        transcript (50KB+ with speaker labels) comes from a different RPC that we need
-        to intercept.
+        The GetTranscription response contains all word-level data with speaker information
+        in word[6]. The parser extracts speaker IDs, groups words by speaker turn, and
+        formats the output to match the official transcript:
+        - Initial text (possibly unlabeled before speaker detection)
+        - [Speaker 1] on its own line, then that speaker's text
+        - [Speaker 2] on its own line, then that speaker's text
+        - etc.
+        - CRLF line endings (Windows format)
 
-        TODO: Identify the RPC that feeds the blob download (Kevin capturing HAR now).
+        The web UI uses this same GetTranscription response to build the client-side blob
+        that gets downloaded as "Recording Name.txt".
         """
         async with async_playwright() as p:
             context = await create_context(p)
@@ -225,7 +230,7 @@ class RecorderClient:
                 continue
         return recordings
 
-    def _parse_official_transcript(self, recording_id: str, text: str) -> Transcript:
+    def _parse_official_transcript_text(self, recording_id: str, text: str) -> Transcript:
         """Parse official transcript download (plain text with speaker labels).
 
         Format (based on real Pixel transcript file):
@@ -325,17 +330,25 @@ class RecorderClient:
         )
 
     def _parse_transcript(self, recording_id: str, data: list) -> Transcript:
-        """Parse GetTranscription response (legacy live caption format).
+        """Parse GetTranscription response to official Pixel transcript format.
 
+        The GetTranscription response (447KB for a 73-min recording) contains:
+        - Full word-level data with speaker information in word[6]
+        - All the data needed to reconstruct the official speaker-labeled transcript
+        
         Response format: [[[segment, ...], ...]]
         Each segment: [sentence, ...]
         Each sentence: [word, ...]
         Each word: [text, alt_display_text, start_ms_str, end_ms_str, ?, ?, [speaker_flags]]
         
-        NOTE: This is the old live caption endpoint that truncates on long recordings.
-        Kept for compatibility but should not be used for primary transcript fetching.
+        We reconstruct the official format:
+        - Initial text (possibly unlabeled before speaker detection)
+        - [Speaker 1] on separate line, then that speaker's text
+        - [Speaker 2] on separate line, then that speaker's text
+        - etc.
         """
-        segments = []
+        # First pass: extract all words with speaker information
+        words_with_speakers = []
         try:
             for segment in data[0]:
                 for sentence in segment:
@@ -343,17 +356,89 @@ class RecorderClient:
                         try:
                             text = str(word[0])
                             start_ms = int(word[2])
-                            segments.append(TranscriptSegment(
-                                timestamp_seconds=start_ms / 1000.0,
-                                speaker=None,
-                                text=text,
-                            ))
+                            # Extract speaker info from word[6] (speaker_flags array)
+                            speaker_id = None
+                            if len(word) > 6 and word[6]:
+                                # speaker_flags is an array, first element may be speaker ID
+                                if isinstance(word[6], list) and len(word[6]) > 0:
+                                    speaker_id = word[6][0] if word[6][0] else None
+                            
+                            words_with_speakers.append({
+                                'text': text,
+                                'start_ms': start_ms,
+                                'speaker_id': speaker_id,
+                            })
                         except (IndexError, TypeError, ValueError):
                             continue
         except (IndexError, TypeError):
             pass
 
-        full_text = " ".join(s.text for s in segments).strip()
+        if not words_with_speakers:
+            return Transcript(recording_id=recording_id, full_text="", segments=[])
+
+        # Second pass: group into speaker turns and format like official transcript
+        lines = []  # Will build the official format line by line
+        segments = []
+        current_speaker = None
+        current_words = []
+        
+        for word_info in words_with_speakers:
+            word_text = word_info['text']
+            speaker_id = word_info['speaker_id']
+            
+            # Detect speaker change
+            if speaker_id != current_speaker:
+                # Save previous segment if any
+                if current_words:
+                    text = ' '.join(current_words)
+                    if current_speaker is not None:
+                        # This was a labeled speaker turn
+                        lines.append('')  # Blank line before speaker label
+                        lines.append(f'[Speaker {current_speaker}]')
+                        lines.append(text)
+                        segments.append(TranscriptSegment(
+                            timestamp_seconds=0.0,
+                            speaker=f'Speaker {current_speaker}',
+                            text=text,
+                        ))
+                    else:
+                        # Initial unlabeled text
+                        lines.append(text)
+                        segments.append(TranscriptSegment(
+                            timestamp_seconds=0.0,
+                            speaker=None,
+                            text=text,
+                        ))
+                    current_words = []
+                
+                # Start new speaker turn
+                current_speaker = speaker_id
+            
+            current_words.append(word_text)
+        
+        # Save final segment
+        if current_words:
+            text = ' '.join(current_words)
+            if current_speaker is not None:
+                lines.append('')
+                lines.append(f'[Speaker {current_speaker}]')
+                lines.append(text)
+                segments.append(TranscriptSegment(
+                    timestamp_seconds=0.0,
+                    speaker=f'Speaker {current_speaker}',
+                    text=text,
+                ))
+            else:
+                lines.append(text)
+                segments.append(TranscriptSegment(
+                    timestamp_seconds=0.0,
+                    speaker=None,
+                    text=text,
+                ))
+        
+        # Join with CRLF (Windows line endings) to match official file
+        full_text = '\r\n'.join(lines)
+        
         return Transcript(
             recording_id=recording_id,
             full_text=full_text,

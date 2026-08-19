@@ -46,7 +46,32 @@ Perfect. Keep me updated on any blockers.
 
 Transcribed by Pixel"""
 
-# Truncated live caption (old format) - simulates what GetTranscription returns
+# GetTranscription format - word arrays with speaker info in word[6]
+# Format: [text, alt_text, start_ms, end_ms, ?, ?, [speaker_flags]]
+# speaker_flags[0] contains the speaker ID (or None/0 for unlabeled)
+
+# Small example showing the format
+SIMPLE_GET_TRANSCRIPTION_DATA = [
+    [
+        # Initial words without speaker (speaker_id = None or 0)
+        [[
+            ["I,", "", "0", "200", None, None, []],
+            ["um.", "", "300", "500", None, None, []],
+        ]],
+        # Words from speaker 1
+        [[
+            ["Hello", "", "1000", "1200", None, None, [1]],
+            ["there", "", "1300", "1500", None, None, [1]],
+        ]],
+        # Words from speaker 2
+        [[
+            ["Hi", "", "2000", "2100", None, None, [2]],
+            ["back", "", "2200", "2300", None, None, [2]],
+        ]],
+    ]
+]
+
+# Truncated version (only first 2 words) - simulates old bug
 TRUNCATED_LIVE_CAPTION_DATA = [
     [
         [[["I", "", "0", "200", None, None, []]]],
@@ -123,43 +148,48 @@ def test_parse_recordings_malformed():
 
 
 def test_parse_transcript():
-    """Parse a real-format GetTranscription response (positional arrays)."""
+    """Parse GetTranscription response to official format with speaker labels."""
     client = RecorderClient()
-    # Real API: [[[segment, ...], ...]]
-    # data[0] = list of segments; each segment = list of sentences; each sentence = list of words
-    # word: [text, alt_text, start_ms_str, end_ms_str, ?, ?, [speaker_flags]]
-    data = [
-        [  # segments
-            [  # segment 0: sentences
-                [  # sentence 0: words
-                    ["Hello", "Hello", "0", "500", None, None, [1]],
-                    ["world", "world", "1500", "2000", None, None, [1]],
-                ],
-            ],
-        ]
-    ]
-    t = client._parse_transcript("rec_1", data)
+    
+    # Use the simple example with speaker info
+    t = client._parse_transcript("rec_1", SIMPLE_GET_TRANSCRIPTION_DATA)
     assert t.recording_id == "rec_1"
-    assert t.full_text == "Hello world"
-    assert len(t.segments) == 2
-    assert t.segments[0].text == "Hello"
-    assert t.segments[0].timestamp_seconds == 0.0
-    assert t.segments[1].text == "world"
-    assert t.segments[1].timestamp_seconds == 1.5
+    
+    # Should reconstruct official format with speaker labels
+    # Initial unlabeled text, then [Speaker 1], then [Speaker 2]
+    assert "I, um." in t.full_text
+    assert "[Speaker 1]" in t.full_text
+    assert "[Speaker 2]" in t.full_text
+    assert "Hello there" in t.full_text
+    assert "Hi back" in t.full_text
+    
+    # Should use CRLF line endings
+    assert "\r\n" in t.full_text
+    
+    # Should have 3 segments: unlabeled, speaker 1, speaker 2
+    assert len(t.segments) == 3
+    assert t.segments[0].speaker is None
+    assert "I, um." in t.segments[0].text
+    assert t.segments[1].speaker == "Speaker 1"
+    assert "Hello there" in t.segments[1].text
+    assert t.segments[2].speaker == "Speaker 2"
+    assert "Hi back" in t.segments[2].text
 
 
 def test_parse_transcript_multi_segment():
-    """Multiple segments concatenate into a single text."""
+    """Multiple segments with same speaker are grouped together."""
     client = RecorderClient()
     data = [
         [
-            [[["Hello", "", "0", "200", None, None, []]]],
-            [[["there", "", "1000", "1200", None, None, []]]],
+            [[["Hello", "", "0", "200", None, None, [1]]]],
+            [[["there", "", "1000", "1200", None, None, [1]]]],
         ]
     ]
     t = client._parse_transcript("rec_1", data)
-    assert t.full_text == "Hello there"
-    assert len(t.segments) == 2
+    # Same speaker, should be one segment
+    assert len(t.segments) == 1
+    assert t.segments[0].speaker == "Speaker 1"
+    assert "Hello there" in t.segments[0].text
 
 
 def test_parse_transcript_empty():
@@ -173,7 +203,7 @@ def test_parse_transcript_empty():
 def test_parse_official_transcript_with_speakers():
     """Parse official transcript format with speaker labels and initial unlabeled text."""
     client = RecorderClient()
-    t = client._parse_official_transcript("rec_1", OFFICIAL_TRANSCRIPT_SHORT)
+    t = client._parse_official_transcript_text("rec_1", OFFICIAL_TRANSCRIPT_SHORT)
     
     # Full text should preserve speaker labels and strip footer
     assert "[Speaker 1]" in t.full_text
@@ -200,7 +230,7 @@ def test_parse_official_transcript_with_speakers():
 def test_parse_official_transcript_long():
     """Parse long official transcript (the kind that would truncate with GetTranscription)."""
     client = RecorderClient()
-    t = client._parse_official_transcript("rec_long", OFFICIAL_TRANSCRIPT_LONG)
+    t = client._parse_official_transcript_text("rec_long", OFFICIAL_TRANSCRIPT_LONG)
     
     # Should contain the full text, not truncated to just "I um"
     assert len(t.full_text) > 100  # Much longer than truncated version
@@ -226,7 +256,7 @@ This transcript has no footer.
 [Speaker 2]
 But it should still parse correctly."""
     
-    t = client._parse_official_transcript("rec_2", text_no_footer)
+    t = client._parse_official_transcript_text("rec_2", text_no_footer)
     assert len(t.segments) == 2
     assert t.segments[0].speaker == "Speaker 1"
     assert t.segments[1].speaker == "Speaker 2"
@@ -237,29 +267,35 @@ def test_parse_official_transcript_no_speakers():
     client = RecorderClient()
     text_no_speakers = "This is a simple transcript without any speaker labels."
     
-    t = client._parse_official_transcript("rec_3", text_no_speakers)
+    t = client._parse_official_transcript_text("rec_3", text_no_speakers)
     assert len(t.segments) == 1
     assert t.segments[0].speaker is None
     assert t.segments[0].text == text_no_speakers
     assert t.full_text == text_no_speakers
 
 
-def test_truncated_vs_official_comparison():
-    """Compare truncated live caption (old) vs official transcript (new).
+def test_truncated_vs_full_comparison():
+    """Compare truncated data (first 2 words) vs full GetTranscription response.
     
-    This demonstrates the bug: GetTranscription returns "I um" (2 words)
-    while the official download returns the complete transcript (100+ words).
+    This demonstrates the OLD bug: we were only reading the first response/few words,
+    but the GetTranscription payload (447KB) contains the FULL transcript.
+    
+    The fix: properly parse ALL words from GetTranscription and extract speaker info.
     """
     client = RecorderClient()
     
-    # Old method (GetTranscription) - returns truncated caption
+    # OLD BUG: Only parsing first 2 words (truncated data)
     truncated = client._parse_transcript("rec_bug", TRUNCATED_LIVE_CAPTION_DATA)
-    assert truncated.full_text == "I um"
-    assert len(truncated.full_text.split()) == 2  # Only 2 words
+    assert "I" in truncated.full_text
+    assert "um" in truncated.full_text
+    assert len(truncated.full_text) < 20  # Very short
     
-    # New method (official download) - returns complete transcript
-    official = client._parse_official_transcript("rec_bug", OFFICIAL_TRANSCRIPT_LONG)
-    assert len(official.full_text.split()) > 100  # 100+ words
+    # NEW: Parsing full GetTranscription response with speaker info
+    full = client._parse_transcript("rec_full", SIMPLE_GET_TRANSCRIPTION_DATA)
+    assert len(full.full_text) > 20  # Much longer
+    assert "[Speaker 1]" in full.full_text  # Has speaker labels
+    assert "[Speaker 2]" in full.full_text
     
-    # The official transcript is 50+ times longer
-    assert len(official.full_text) > 50 * len(truncated.full_text)
+    # Full version has speaker information
+    assert any(s.speaker == "Speaker 1" for s in full.segments)
+    assert any(s.speaker == "Speaker 2" for s in full.segments)

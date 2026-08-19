@@ -36,25 +36,38 @@ REPRO_TRUNCATED_GRPC_DATA = [
 ]
 
 # A representative excerpt from the official 50,970-byte download (the fix)
-REPRO_OFFICIAL_DOWNLOAD = """[Speaker 1] I um, so I wanted to start by discussing the architecture decisions we made last week.
+# Real format has initial unlabeled text, then [Speaker N] on separate lines
+REPRO_OFFICIAL_DOWNLOAD = """I um, so I wanted to start by discussing something.
 
-[Speaker 2] Yes, that sounds good. I have some concerns about the database schema changes.
+[Speaker 1]
+I wanted to start by discussing the architecture decisions we made last week.
 
-[Speaker 1] Absolutely, let's walk through each one. First, the user authentication table needs to support OAuth providers, so we added a polymorphic relationship.
+[Speaker 2]
+Yes, that sounds good. I have some concerns about the database schema changes.
 
-[Speaker 2] That makes sense. What about the session handling?
+[Speaker 1]
+Absolutely, let's walk through each one. First, the user authentication table needs to support OAuth providers, so we added a polymorphic relationship.
 
-[Speaker 1] We're using Redis for session storage now, which gives us automatic expiration and better performance under load.
+[Speaker 2]
+That makes sense. What about the session handling?
 
-[Speaker 2] Great. How does that integrate with the existing API?
+[Speaker 1]
+We're using Redis for session storage now, which gives us automatic expiration and better performance under load.
 
-[Speaker 1] The middleware layer handles it transparently. No changes needed to existing endpoints.
+[Speaker 2]
+Great. How does that integrate with the existing API?
 
-[Speaker 2] Perfect. What about testing?
+[Speaker 1]
+The middleware layer handles it transparently. No changes needed to existing endpoints.
 
-[Speaker 1] We've added integration tests for all the OAuth flows and session persistence. The test suite passes locally but we need to verify in staging.
+[Speaker 2]
+Perfect. What about testing?
 
-[Speaker 2] Excellent work. Keep me posted on the staging deployment.
+[Speaker 1]
+We've added integration tests for all the OAuth flows and session persistence. The test suite passes locally but we need to verify in staging.
+
+[Speaker 2]
+Excellent work. Keep me posted on the staging deployment.
 
 Transcribed by Pixel"""
 
@@ -79,7 +92,7 @@ def test_root_cause_truncated_grpc_vs_official_download():
     
     # NEW PATH (fix): Official download endpoint
     # Returns complete transcript with speaker labels
-    official = client._parse_official_transcript(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
+    official = client._parse_official_transcript_text(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
     assert len(official.full_text) > 900  # Much larger than 4 bytes
     assert "[Speaker 1]" in official.full_text
     assert "[Speaker 2]" in official.full_text
@@ -99,7 +112,7 @@ def test_official_transcript_has_speaker_labels():
     assert all(s.speaker is None for s in old.segments)
     
     # New format (official download) has speaker labels
-    new = client._parse_official_transcript(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
+    new = client._parse_official_transcript_text(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
     assert any(s.speaker == "Speaker 1" for s in new.segments)
     assert any(s.speaker == "Speaker 2" for s in new.segments)
 
@@ -118,7 +131,7 @@ def test_official_transcript_matches_web_ui_download():
     - Footer: "Transcribed by Pixel"
     """
     client = RecorderClient()
-    transcript = client._parse_official_transcript(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
+    transcript = client._parse_official_transcript_text(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
     
     # Full content (not truncated to "I um")
     assert "I um" in transcript.full_text
@@ -133,26 +146,29 @@ def test_official_transcript_matches_web_ui_download():
 
 
 def test_endpoint_urls_documented():
-    """Document the endpoint URLs for clarity.
+    """Document the actual endpoint: GetTranscription gRPC.
     
-    OLD (bug):
-    - gRPC endpoint via Playwright intercept: GetTranscription
-    - Triggered by navigating to: https://recorder.google.com/{audio_id}
-    - Returns: nested array of word objects with timestamps
-    - Problem: Truncates silently on long recordings
+    DISCOVERY:
+    - GetTranscription gRPC response is 447KB for a 73-min recording
+    - Contains ALL word-level data with speaker info in word[6]
+    - Web UI builds client-side blob from this same response
+    - No separate transcript download URL exists
     
-    NEW (fix):
-    - Direct HTTP GET: https://usercontent.recorder.google.com/download/transcript/{audio_id}
-    - Returns: plain text with speaker labels
-    - Same endpoint the web UI "Download" button uses
+    OLD BUG:
+    - Parser only read first few words (truncated to "I um")
+    - Ignored speaker info in word[6]
+    - Only used word[0] for text
+    
+    NEW FIX:
+    - Parse FULL GetTranscription response (all 447KB)
+    - Extract speaker IDs from word[6]
+    - Reconstruct official format with speaker labels
     """
-    from recorder_cli.recorder import _TRANSCRIPT_BASE, _GRPC_BASE, RECORDER_URL
+    from recorder_cli.recorder import _GRPC_BASE, RECORDER_URL
     
-    # New official download endpoint
-    assert _TRANSCRIPT_BASE == "https://usercontent.recorder.google.com/download/transcript"
-    
-    # For reference, the old gRPC base (still in code but not used for transcript fetch)
+    # GetTranscription gRPC endpoint (the actual source)
     assert "pixelrecorder-pa.clients6.google.com" in _GRPC_BASE
+    assert "PlaybackService" in _GRPC_BASE
     assert "recorder.google.com" in RECORDER_URL
 
 
@@ -200,7 +216,7 @@ def test_long_recording_word_count_comparison():
     truncated_density = truncated_words / REPRO_DURATION_SECONDS
     assert truncated_density < 0.001  # Less than 1 word per 1000 seconds (clearly broken)
     
-    official = client._parse_official_transcript(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
+    official = client._parse_official_transcript_text(REPRO_RECORDING_ID, REPRO_OFFICIAL_DOWNLOAD)
     official_words = len(official.full_text.split())
     assert official_words > 100  # Much more content
     
