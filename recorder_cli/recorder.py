@@ -466,10 +466,14 @@ class RecorderClient:
                             current_line = []
                         
                         # Emit blank line + speaker header for NEW paragraph
-                        # (even if speaker hasn't changed - this is the official format)
-                        if word_speaker > 0:
+                        # BUT: Skip if we just emitted this exact header (dedup consecutive headers)
+                        # This happens when speaker change AND paragraph break occur on same word
+                        expected_header = f'[Speaker {word_speaker}]'
+                        last_line = output_lines[-1] if output_lines else None
+                        
+                        if word_speaker > 0 and last_line != expected_header:
                             output_lines.append('')  # Blank line
-                            output_lines.append(f'[Speaker {word_speaker}]')
+                            output_lines.append(expected_header)
                         
                         # Continue with text after the newline
                         text = text[1:]
