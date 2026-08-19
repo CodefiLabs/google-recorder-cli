@@ -392,6 +392,7 @@ class RecorderClient:
         - 343 [Speaker N] headers (emitted at start of each paragraph, even for same speaker)
         - 179 paragraph breaks (word[1] starting with '\\n')
         - First paragraph unlabeled (first 9 words have speaker_id 0)
+        - First letter after each [Speaker N] header is capitalized
         - SHA256: 2dcfdf2314a0b821b5743fda92e8d9aaed02c885187c7c2099aabe062f6874b5
         """
         output_lines = []
@@ -399,6 +400,7 @@ class RecorderClient:
         current_speaker = None
         current_line = []
         current_segment_text = []
+        capitalize_next = False  # Track if we need to capitalize the next word
         
         try:
             # Walk all sentence units (1013 units in Joel recording)
@@ -452,6 +454,7 @@ class RecorderClient:
                         if word_speaker > 0:
                             output_lines.append('')  # Blank line
                             output_lines.append(f'[Speaker {word_speaker}]')
+                            capitalize_next = True  # Capitalize first word after header
                         
                         current_speaker = word_speaker
                     
@@ -474,9 +477,19 @@ class RecorderClient:
                         if word_speaker > 0 and last_line != expected_header:
                             output_lines.append('')  # Blank line
                             output_lines.append(expected_header)
+                            capitalize_next = True  # Capitalize first word after header
                         
                         # Continue with text after the newline
                         text = text[1:]
+                    
+                    # Capitalize first alphabetic character if we just emitted a speaker header
+                    if text and capitalize_next:
+                        # Find first alphabetic character and capitalize it
+                        for i, char in enumerate(text):
+                            if char.isalpha():
+                                text = text[:i] + char.upper() + text[i+1:]
+                                capitalize_next = False
+                                break
                     
                     if text:
                         current_line.append(text)
