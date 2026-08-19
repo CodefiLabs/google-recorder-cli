@@ -74,6 +74,10 @@ recorder skill uninstall   # idempotent
 
 Uses Playwright to load recorder.google.com and intercept JSON responses from the page's internal API calls. No API reverse-engineering required — the tool captures structured data directly from network traffic.
 
+## Transcript Format
+
+Transcripts include speaker labels (e.g. `[Speaker 1]`, `[Speaker 2]`) and are fetched from Google's official download endpoint — the same source as the web UI's "Download" button. This ensures complete transcripts even for long recordings, rather than truncated live captions.
+
 ## Limitations
 
 - Read-only — cannot create or edit recordings

@@ -12,6 +12,7 @@ _GRPC_BASE = (
     "/$rpc/java.com.google.wireless.android.pixel.recorder.protos.PlaybackService"
 )
 _AUDIO_BASE = "https://usercontent.recorder.google.com/download/playback"
+_TRANSCRIPT_BASE = "https://usercontent.recorder.google.com/download/transcript"
 
 
 def _intercept_grpc(page, endpoint: str) -> asyncio.Future:
@@ -62,17 +63,20 @@ class RecorderClient:
 
     async def get_transcript(self, recording_id: str) -> Transcript:
         """
-        Fetch transcript for a recording.
+        Fetch the official full transcript for a recording.
 
-        The app URLs use audio_id (not recording_id), so we:
-        1. Load the main page to get the recording list (and find audio_id)
-        2. Navigate to RECORDER_URL/{audio_id} which auto-triggers GetTranscription
+        This fetches the official Pixel transcript (speaker-labeled, complete)
+        from the same download endpoint that the web UI's "Download" button uses,
+        rather than the truncated live on-device caption from GetTranscription.
+
+        The official transcript includes speaker labels ([Speaker N]) and a
+        footer "Transcribed by Pixel" and is always complete even for long recordings.
         """
         async with async_playwright() as p:
             context = await create_context(p)
             page = await context.new_page()
             try:
-                # Step 1: get recording list to find audio_id
+                # Get recording list to find audio_id
                 list_future = _intercept_grpc(page, "GetRecordingList")
                 await page.goto(RECORDER_URL)
                 try:
@@ -90,17 +94,18 @@ class RecorderClient:
                 if not audio_id:
                     raise ValueError(f"Recording not found: {recording_id}")
 
-                # Step 2: navigate to the recording URL to trigger GetTranscription
-                trans_future = _intercept_grpc(page, "GetTranscription")
-                await page.goto(f"{RECORDER_URL}/{audio_id}")
-                try:
-                    data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
-                except asyncio.TimeoutError:
-                    raise TimeoutError(
-                        f"Transcript not available for {recording_id}. "
-                        "The recording may not have a transcript yet."
+                # Fetch the official transcript download
+                url = f"{_TRANSCRIPT_BASE}/{audio_id}"
+                response = await page.request.get(url)
+                if not response.ok:
+                    raise RuntimeError(
+                        f"Failed to download transcript: HTTP {response.status}. "
+                        f"The recording may not have a transcript yet."
                     )
-                return self._parse_transcript(recording_id, data)
+
+                # Official transcript is plain text with speaker labels
+                text = (await response.body()).decode('utf-8')
+                return self._parse_official_transcript(recording_id, text)
             finally:
                 await context.close()
 
@@ -216,13 +221,72 @@ class RecorderClient:
                 continue
         return recordings
 
+    def _parse_official_transcript(self, recording_id: str, text: str) -> Transcript:
+        """Parse official transcript download (plain text with speaker labels).
+
+        Format:
+            [Speaker 1] text text text
+            [Speaker 2] text text text
+            ...
+            Transcribed by Pixel
+        
+        Speaker labels are preserved in the full_text. The footer is stripped.
+        Segments are created per speaker turn (timestamp info not available in official format).
+        """
+        # Remove the "Transcribed by Pixel" footer if present
+        footer = "Transcribed by Pixel"
+        if text.strip().endswith(footer):
+            text = text[:-len(footer)].strip()
+
+        # Split into segments by speaker labels
+        import re
+        segments = []
+        # Pattern matches [Speaker N] at start of line or after whitespace
+        pattern = r'(\[Speaker \d+\])'
+        parts = re.split(pattern, text)
+        
+        current_speaker = None
+        for i, part in enumerate(parts):
+            part = part.strip()
+            if not part:
+                continue
+            
+            # Check if this is a speaker label
+            speaker_match = re.match(r'\[Speaker (\d+)\]', part)
+            if speaker_match:
+                current_speaker = f"Speaker {speaker_match.group(1)}"
+            elif current_speaker:
+                # This is text content following a speaker label
+                segments.append(TranscriptSegment(
+                    timestamp_seconds=0.0,  # Not available in official format
+                    speaker=current_speaker,
+                    text=part,
+                ))
+        
+        # If no speaker labels found, treat entire text as a single segment
+        if not segments:
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=None,
+                text=text,
+            ))
+
+        return Transcript(
+            recording_id=recording_id,
+            full_text=text,
+            segments=segments,
+        )
+
     def _parse_transcript(self, recording_id: str, data: list) -> Transcript:
-        """Parse GetTranscription response.
+        """Parse GetTranscription response (legacy live caption format).
 
         Response format: [[[segment, ...], ...]]
         Each segment: [sentence, ...]
         Each sentence: [word, ...]
         Each word: [text, alt_display_text, start_ms_str, end_ms_str, ?, ?, [speaker_flags]]
+        
+        NOTE: This is the old live caption endpoint that truncates on long recordings.
+        Kept for compatibility but should not be used for primary transcript fetching.
         """
         segments = []
         try:
