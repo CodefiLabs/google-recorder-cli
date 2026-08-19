@@ -14,28 +14,66 @@ _GRPC_BASE = (
 _AUDIO_BASE = "https://usercontent.recorder.google.com/download/playback"
 
 
-def _intercept_grpc(page, endpoint: str) -> asyncio.Future:
+def _intercept_grpc(page, endpoint: str, wait_for_largest: bool = False) -> asyncio.Future:
     """
-    Register a one-shot response interceptor for a gRPC endpoint.
-    Returns a Future that resolves with the parsed JSON body of the first matching response.
+    Register a response interceptor for a gRPC endpoint.
+    
+    Args:
+        page: Playwright page object
+        endpoint: Endpoint name to match (e.g., "GetTranscription")
+        wait_for_largest: If True, collect all responses and return the largest one
+                         (useful for GetTranscription which may send small then large payloads)
+    
+    Returns a Future that resolves with the parsed JSON body.
     The listener is automatically removed once the future resolves.
     """
     loop = asyncio.get_event_loop()
     future: asyncio.Future = loop.create_future()
 
-    def on_response(response: object) -> None:
-        if endpoint in response.url and not future.done():  # type: ignore[attr-defined]
-            async def _read() -> None:
-                try:
-                    data = await response.json()  # type: ignore[attr-defined]
-                    if not future.done():
-                        future.set_result(data)
-                except Exception:
-                    pass
-            asyncio.ensure_future(_read())
+    if not wait_for_largest:
+        # Original one-shot behavior: return first response
+        def on_response(response: object) -> None:
+            if endpoint in response.url and not future.done():  # type: ignore[attr-defined]
+                async def _read() -> None:
+                    try:
+                        data = await response.json()  # type: ignore[attr-defined]
+                        if not future.done():
+                            future.set_result(data)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_read())
 
-    page.on("response", on_response)
-    future.add_done_callback(lambda _: page.remove_listener("response", on_response))
+        page.on("response", on_response)
+        future.add_done_callback(lambda _: page.remove_listener("response", on_response))
+    else:
+        # Collect all responses and return the largest
+        responses = []
+        
+        def on_response(response: object) -> None:
+            if endpoint in response.url:  # type: ignore[attr-defined]
+                async def _read() -> None:
+                    try:
+                        data = await response.json()  # type: ignore[attr-defined]
+                        responses.append(data)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_read())
+        
+        page.on("response", on_response)
+        
+        # Set up cleanup - after a delay, pick the largest response
+        async def _resolve_largest():
+            # Wait a bit for all responses to arrive
+            await asyncio.sleep(3)
+            if responses and not future.done():
+                # Return the largest response (by JSON string length)
+                import json
+                largest = max(responses, key=lambda r: len(json.dumps(r)))
+                future.set_result(largest)
+                page.remove_listener("response", on_response)
+        
+        asyncio.ensure_future(_resolve_largest())
+    
     return future
 
 
@@ -103,9 +141,9 @@ class RecorderClient:
                     raise ValueError(f"Recording not found: {recording_id}")
 
                 # Step 2: navigate to the recording URL to trigger GetTranscription
-                # NOTE: This returns truncated live caption on long recordings
-                # The official transcript comes from a different RPC we haven't identified yet
-                trans_future = _intercept_grpc(page, "GetTranscription")
+                # NOTE: GetTranscription may fire multiple times - we want the LARGEST response
+                # (small initial response ~4 bytes, then full 447KB response)
+                trans_future = _intercept_grpc(page, "GetTranscription", wait_for_largest=True)
                 await page.goto(f"{RECORDER_URL}/{audio_id}")
                 try:
                     data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
@@ -357,11 +395,15 @@ class RecorderClient:
                             text = str(word[0])
                             start_ms = int(word[2])
                             # Extract speaker info from word[6] (speaker_flags array)
+                            # Format: [0, 2] where first element is speaker ID (0 = unlabeled, 1+ = Speaker N)
                             speaker_id = None
                             if len(word) > 6 and word[6]:
-                                # speaker_flags is an array, first element may be speaker ID
                                 if isinstance(word[6], list) and len(word[6]) > 0:
-                                    speaker_id = word[6][0] if word[6][0] else None
+                                    # speaker_flags[0] is the speaker ID
+                                    # 0 or None = unlabeled, 1+ = Speaker N
+                                    raw_id = word[6][0]
+                                    if raw_id and raw_id > 0:
+                                        speaker_id = raw_id
                             
                             words_with_speakers.append({
                                 'text': text,
