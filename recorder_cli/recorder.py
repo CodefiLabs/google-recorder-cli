@@ -12,7 +12,6 @@ _GRPC_BASE = (
     "/$rpc/java.com.google.wireless.android.pixel.recorder.protos.PlaybackService"
 )
 _AUDIO_BASE = "https://usercontent.recorder.google.com/download/playback"
-_TRANSCRIPT_BASE = "https://usercontent.recorder.google.com/download/transcript"
 
 
 def _intercept_grpc(page, endpoint: str) -> asyncio.Future:
@@ -65,12 +64,16 @@ class RecorderClient:
         """
         Fetch transcript for a recording.
 
-        CURRENT STATE: This method is being fixed to find the official Pixel transcript
-        download endpoint. The GetTranscription gRPC endpoint returns truncated captions
-        on long recordings. The web UI's "Download" button gets a complete 50KB+ transcript
-        with speaker labels, but we haven't identified the correct endpoint yet.
+        CURRENT STATE: The web UI's Download button creates a client-side blob from
+        data fetched via an in-page RPC (not a static file URL). We need to identify
+        which PlaybackService RPC provides the formatted official transcript text that
+        includes speaker labels like [Speaker 1] and the "Transcribed by Pixel" footer.
 
-        TODO: Find the actual request that the overflow menu → Download button makes.
+        The live caption from GetTranscription truncates on long recordings. The official
+        transcript (50KB+ with speaker labels) comes from a different RPC that we need
+        to intercept.
+
+        TODO: Identify the RPC that feeds the blob download (Kevin capturing HAR now).
         """
         async with async_playwright() as p:
             context = await create_context(p)
@@ -95,6 +98,8 @@ class RecorderClient:
                     raise ValueError(f"Recording not found: {recording_id}")
 
                 # Step 2: navigate to the recording URL to trigger GetTranscription
+                # NOTE: This returns truncated live caption on long recordings
+                # The official transcript comes from a different RPC we haven't identified yet
                 trans_future = _intercept_grpc(page, "GetTranscription")
                 await page.goto(f"{RECORDER_URL}/{audio_id}")
                 try:
@@ -223,14 +228,20 @@ class RecorderClient:
     def _parse_official_transcript(self, recording_id: str, text: str) -> Transcript:
         """Parse official transcript download (plain text with speaker labels).
 
-        Format:
-            [Speaker 1] text text text
-            [Speaker 2] text text text
+        Format (based on real Pixel transcript file):
+            Initial text (possibly unlabeled)
+            
+            [Speaker 1]
+            Text from speaker 1...
+            
+            [Speaker 2]
+            Text from speaker 2...
             ...
             Transcribed by Pixel
         
-        Speaker labels are preserved in the full_text. The footer is stripped.
-        Segments are created per speaker turn (timestamp info not available in official format).
+        The first few lines may appear before any speaker label. Speaker labels are
+        preserved in the full_text. The footer is stripped. Segments are created per
+        speaker turn (timestamp info not available in official format).
         """
         # Remove the "Transcribed by Pixel" footer if present
         footer = "Transcribed by Pixel"
@@ -240,29 +251,66 @@ class RecorderClient:
         # Split into segments by speaker labels
         import re
         segments = []
-        # Pattern matches [Speaker N] at start of line or after whitespace
-        pattern = r'(\[Speaker \d+\])'
-        parts = re.split(pattern, text)
+        # Pattern matches [Speaker N] on its own line
+        pattern = r'^\[Speaker (\d+)\]$'
         
+        lines = text.split('\n')
         current_speaker = None
-        for i, part in enumerate(parts):
-            part = part.strip()
-            if not part:
+        current_text = []
+        initial_text = []  # Text before first speaker label
+        found_first_speaker = False
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
                 continue
             
-            # Check if this is a speaker label
-            speaker_match = re.match(r'\[Speaker (\d+)\]', part)
+            # Check if this line is a speaker label
+            speaker_match = re.match(pattern, line)
             if speaker_match:
+                # Save previous segment if any
+                if current_speaker and current_text:
+                    segments.append(TranscriptSegment(
+                        timestamp_seconds=0.0,
+                        speaker=current_speaker,
+                        text=' '.join(current_text),
+                    ))
+                    current_text = []
+                elif not found_first_speaker and initial_text:
+                    # Save initial unlabeled text as a segment
+                    segments.append(TranscriptSegment(
+                        timestamp_seconds=0.0,
+                        speaker=None,
+                        text=' '.join(initial_text),
+                    ))
+                    initial_text = []
+                
+                # Start new speaker
                 current_speaker = f"Speaker {speaker_match.group(1)}"
-            elif current_speaker:
-                # This is text content following a speaker label
-                segments.append(TranscriptSegment(
-                    timestamp_seconds=0.0,  # Not available in official format
-                    speaker=current_speaker,
-                    text=part,
-                ))
+                found_first_speaker = True
+            else:
+                # This is text content
+                if found_first_speaker:
+                    current_text.append(line)
+                else:
+                    initial_text.append(line)
         
-        # If no speaker labels found, treat entire text as a single segment
+        # Save final segment
+        if current_speaker and current_text:
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=current_speaker,
+                text=' '.join(current_text),
+            ))
+        elif not found_first_speaker and initial_text:
+            # Only unlabeled text, no speakers
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=None,
+                text=' '.join(initial_text),
+            ))
+        
+        # If no segments at all, treat entire text as one segment
         if not segments:
             segments.append(TranscriptSegment(
                 timestamp_seconds=0.0,
