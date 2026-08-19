@@ -66,26 +66,26 @@ SIMPLE_GET_TRANSCRIPTION_DATA = [
                 ["I", "I,", "0", "200", None, None, [0, 0]],
                 ["um", "um.", "300", "500", None, None, [0, 0]],
             ],
-            0,  # sentence int
-            "00000"  # sentence str
+            0,  # sentence int (always 0)
+            "00000"  # sentence str (always same)
         ],
         # Sentence unit 2: Speaker 1
         [
             [
-                ["Hello", "Hello", "1000", "1200", None, None, [1, 2]],
-                ["there", "there", "1300", "1500", None, None, [1, 2]],
+                ["Hello", "Hello", "1000", "1200", None, None, [0, 1]],  # word[6] = [flag0, speaker_id]
+                ["there", "there", "1300", "1500", None, None, [0, 1]],
             ],
-            1,
-            "00001"
+            0,
+            "00000"
         ],
         # Sentence unit 3: Speaker 2
         [
             [
-                ["Hi", "Hi", "2000", "2100", None, None, [2, 1]],
-                ["back", "back", "2200", "2300", None, None, [2, 1]],
+                ["Hi", "Hi", "2000", "2100", None, None, [0, 2]],
+                ["back", "back", "2200", "2300", None, None, [0, 2]],
             ],
-            2,
-            "00002"
+            0,
+            "00000"
         ],
     ]
 ]
@@ -94,14 +94,14 @@ SIMPLE_GET_TRANSCRIPTION_DATA = [
 # parser crashed after first unit and dropped remaining 1012 units
 TRUNCATED_LIVE_CAPTION_DATA = [
     [
-        # Only first sentence unit (the bug: parser crashes on unit[1]/unit[2])
+        # Only first sentence unit (the bug: parser aborts early)
         [
             [
-                ["I", None, "0", "200", None, None, [0, 0]],
+                ["I", None, "0", "200", None, None, [0, 0]],  # word[6] = [flag0, speaker_id]
                 ["um", None, "300", "500", None, None, [0, 0]],
             ],
-            0,
-            "00000"
+            0,  # always 0
+            "00000"  # always same
         ],
     ]
 ]
@@ -204,12 +204,26 @@ def test_parse_transcript():
 
 
 def test_parse_transcript_multi_segment():
-    """Multiple segments with same speaker are grouped together."""
+    """Multiple sentence units with same speaker are grouped together."""
     client = RecorderClient()
     data = [
         [
-            [[["Hello", "", "0", "200", None, None, [1]]]],
-            [[["there", "", "1000", "1200", None, None, [1]]]],
+            # Unit 1: Speaker 1
+            [
+                [
+                    ["Hello", "", "0", "200", None, None, [0, 1]],  # word[6] = [flag0, speaker_id]
+                ],
+                0,
+                "00000"
+            ],
+            # Unit 2: Same speaker (1)
+            [
+                [
+                    ["there", "", "1000", "1200", None, None, [0, 1]],
+                ],
+                0,
+                "00000"
+            ],
         ]
     ]
     t = client._parse_transcript("rec_1", data)

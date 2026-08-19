@@ -371,26 +371,36 @@ class RecorderClient:
     def _parse_transcript(self, recording_id: str, data: list) -> Transcript:
         """Parse GetTranscription response to official Pixel transcript format.
 
-        Actual structure (from 447KB response):
-        data[0] = list of 1013 sentence units (NOT nested arrays)
-        Each unit = [words[], sentence_speaker_int, sentence_field_str]
-        - unit[0] = FLAT list of 1-64 word objects
-        - unit[1] = int (possibly sentence-level speaker)
-        - unit[2] = str (sentence-level field, NOT iterable)
+        Actual structure (from 447KB response, live schema):
+        data[0] = list of 1013 sentence units
+        Each unit = [words[], int(0), str5] — always length 3
+        - unit[0] = FLAT list of word objects
+        - unit[1] = always 0 (not speaker)
+        - unit[2] = always same 5-char BCP-47-like string (not iterable)
         
-        Each word = [text, alt_display_text, start_ms, end_ms, null, null, [speaker_flags]]
+        Each word = [text, alt_display_text, start_ms, end_ms, null, null, [flag, speaker_id]]
         - word[0] = raw token (always present)
         - word[1] = display text with punctuation (or null) - PREFER THIS when present
-        - word[6] = [speaker_id, ?] where speaker_id: None/0=unlabeled, 1+=Speaker N
+                    179 word[1] values start with '\\n' (embedded line breaks)
+        - word[6] = [flag0, speaker_id] where:
+                    flag0: 0 or 1 (not speaker - distribution {0:8370, 1:199})
+                    speaker_id at INDEX 1: 0=unlabeled, 1-7=Speaker N
+                    Distribution: {0:9, 1:5122, 2:3209, 3:86, 4:18, 5:33, 6:46, 7:46}
         
-        Official format: 1029 lines, one block per sentence unit, CRLF, speaker headers
+        Official format to match:
+        - 50970 bytes, CRLF line endings
+        - 343 [Speaker N] headers total (NOT per-unit, only on speaker change)
+        - First paragraph unlabeled (first 9 words have speaker_id 0)
+        - SHA256: 2dcfdf2314a0b821b5743fda92e8d9aaed02c885187c7c2099aabe062f6874b5
         """
-        lines = []
+        output_lines = []
         segments = []
         current_speaker = None
+        current_line = []
+        current_segment_text = []
         
         try:
-            # Walk sentence units (1013 units in Joel recording)
+            # Walk all sentence units (1013 units in Joel recording)
             for unit in data[0]:
                 if not isinstance(unit, list) or len(unit) < 1:
                     continue
@@ -400,10 +410,7 @@ class RecorderClient:
                 if not isinstance(words, list):
                     continue
                 
-                # Extract words and determine speaker for this sentence unit
-                sentence_words = []
-                sentence_speaker = None
-                
+                # Process each word in this unit
                 for word in words:
                     if not isinstance(word, list) or len(word) < 7:
                         continue
@@ -413,51 +420,75 @@ class RecorderClient:
                     if not text:
                         continue
                     
-                    sentence_words.append(str(text))
+                    text = str(text)
                     
-                    # Extract speaker from word[6] speaker_flags
-                    if word[6] and isinstance(word[6], list) and len(word[6]) > 0:
-                        raw_id = word[6][0]
-                        if raw_id and raw_id > 0:
-                            sentence_speaker = raw_id
-                
-                if not sentence_words:
-                    continue
-                
-                # Join words with spaces for this sentence
-                sentence_text = ' '.join(sentence_words)
-                
-                # Detect speaker change
-                if sentence_speaker != current_speaker:
-                    # Add header for new speaker (if labeled)
-                    if sentence_speaker is not None:
-                        lines.append('')  # Blank line
-                        lines.append(f'[Speaker {sentence_speaker}]')
+                    # Extract speaker from word[6][1] (NOT word[6][0] which is a flag)
+                    word_speaker = 0  # Default: unlabeled
+                    if word[6] and isinstance(word[6], list) and len(word[6]) > 1:
+                        speaker_id = word[6][1]
+                        if speaker_id is not None:
+                            word_speaker = speaker_id
                     
-                    current_speaker = sentence_speaker
-                
-                # Add sentence text
-                lines.append(sentence_text)
-                
-                # Create segment (group consecutive sentences by speaker for segments)
-                if not segments or segments[-1].speaker != (f'Speaker {current_speaker}' if current_speaker else None):
-                    segments.append(TranscriptSegment(
-                        timestamp_seconds=0.0,
-                        speaker=f'Speaker {current_speaker}' if current_speaker else None,
-                        text=sentence_text,
-                    ))
-                else:
-                    # Same speaker, append to last segment
-                    segments[-1].text += ' ' + sentence_text
+                    # Detect speaker change - emit header
+                    if word_speaker != current_speaker:
+                        # Flush current line
+                        if current_line:
+                            line_text = ' '.join(current_line)
+                            output_lines.append(line_text)
+                            current_segment_text.append(line_text)
+                            current_line = []
+                        
+                        # Save previous segment
+                        if current_segment_text:
+                            segments.append(TranscriptSegment(
+                                timestamp_seconds=0.0,
+                                speaker=f'Speaker {current_speaker}' if current_speaker and current_speaker > 0 else None,
+                                text=' '.join(current_segment_text),
+                            ))
+                            current_segment_text = []
+                        
+                        # Emit speaker header (skip for unlabeled speaker_id 0)
+                        if word_speaker > 0:
+                            output_lines.append('')  # Blank line
+                            output_lines.append(f'[Speaker {word_speaker}]')
+                        
+                        current_speaker = word_speaker
+                    
+                    # Handle embedded newlines in word[1] (179 cases)
+                    if text.startswith('\n'):
+                        # Flush current line before newline
+                        if current_line:
+                            line_text = ' '.join(current_line)
+                            output_lines.append(line_text)
+                            current_segment_text.append(line_text)
+                            current_line = []
+                        # Add the text after the newline to next line
+                        text = text[1:]
+                    
+                    if text:
+                        current_line.append(text)
         
         except (IndexError, TypeError) as e:
             pass
 
-        if not lines:
+        # Flush final line and segment
+        if current_line:
+            line_text = ' '.join(current_line)
+            output_lines.append(line_text)
+            current_segment_text.append(line_text)
+        
+        if current_segment_text:
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=f'Speaker {current_speaker}' if current_speaker and current_speaker > 0 else None,
+                text=' '.join(current_segment_text),
+            ))
+        
+        if not output_lines:
             return Transcript(recording_id=recording_id, full_text="", segments=[])
         
-        # Join with CRLF (Windows line endings) to match official file
-        full_text = '\r\n'.join(lines)
+        # Join with CRLF (Windows line endings)
+        full_text = '\r\n'.join(output_lines)
         
         return Transcript(
             recording_id=recording_id,
