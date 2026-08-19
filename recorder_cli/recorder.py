@@ -63,20 +63,20 @@ class RecorderClient:
 
     async def get_transcript(self, recording_id: str) -> Transcript:
         """
-        Fetch the official full transcript for a recording.
+        Fetch transcript for a recording.
 
-        This fetches the official Pixel transcript (speaker-labeled, complete)
-        from the same download endpoint that the web UI's "Download" button uses,
-        rather than the truncated live on-device caption from GetTranscription.
+        CURRENT STATE: This method is being fixed to find the official Pixel transcript
+        download endpoint. The GetTranscription gRPC endpoint returns truncated captions
+        on long recordings. The web UI's "Download" button gets a complete 50KB+ transcript
+        with speaker labels, but we haven't identified the correct endpoint yet.
 
-        The official transcript includes speaker labels ([Speaker N]) and a
-        footer "Transcribed by Pixel" and is always complete even for long recordings.
+        TODO: Find the actual request that the overflow menu → Download button makes.
         """
         async with async_playwright() as p:
             context = await create_context(p)
             page = await context.new_page()
             try:
-                # Get recording list to find audio_id
+                # Step 1: get recording list to find audio_id
                 list_future = _intercept_grpc(page, "GetRecordingList")
                 await page.goto(RECORDER_URL)
                 try:
@@ -94,18 +94,17 @@ class RecorderClient:
                 if not audio_id:
                     raise ValueError(f"Recording not found: {recording_id}")
 
-                # Fetch the official transcript download
-                url = f"{_TRANSCRIPT_BASE}/{audio_id}"
-                response = await page.request.get(url)
-                if not response.ok:
-                    raise RuntimeError(
-                        f"Failed to download transcript: HTTP {response.status}. "
-                        f"The recording may not have a transcript yet."
+                # Step 2: navigate to the recording URL to trigger GetTranscription
+                trans_future = _intercept_grpc(page, "GetTranscription")
+                await page.goto(f"{RECORDER_URL}/{audio_id}")
+                try:
+                    data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        f"Transcript not available for {recording_id}. "
+                        "The recording may not have a transcript yet."
                     )
-
-                # Official transcript is plain text with speaker labels
-                text = (await response.body()).decode('utf-8')
-                return self._parse_official_transcript(recording_id, text)
+                return self._parse_transcript(recording_id, data)
             finally:
                 await context.close()
 
