@@ -389,7 +389,8 @@ class RecorderClient:
         
         Official format to match:
         - 50970 bytes, CRLF line endings
-        - 343 [Speaker N] headers total (NOT per-unit, only on speaker change)
+        - 343 [Speaker N] headers (emitted at start of each paragraph, even for same speaker)
+        - 179 paragraph breaks (word[1] starting with '\\n')
         - First paragraph unlabeled (first 9 words have speaker_id 0)
         - SHA256: 2dcfdf2314a0b821b5743fda92e8d9aaed02c885187c7c2099aabe062f6874b5
         """
@@ -454,15 +455,23 @@ class RecorderClient:
                         
                         current_speaker = word_speaker
                     
-                    # Handle embedded newlines in word[1] (179 cases)
+                    # Handle embedded newlines in word[1] (179 cases = paragraph breaks)
+                    # Official format: emit [Speaker N] at START of each paragraph
                     if text.startswith('\n'):
-                        # Flush current line before newline
+                        # Flush current line before paragraph break
                         if current_line:
                             line_text = ' '.join(current_line)
                             output_lines.append(line_text)
                             current_segment_text.append(line_text)
                             current_line = []
-                        # Add the text after the newline to next line
+                        
+                        # Emit blank line + speaker header for NEW paragraph
+                        # (even if speaker hasn't changed - this is the official format)
+                        if word_speaker > 0:
+                            output_lines.append('')  # Blank line
+                            output_lines.append(f'[Speaker {word_speaker}]')
+                        
+                        # Continue with text after the newline
                         text = text[1:]
                     
                     if text:
