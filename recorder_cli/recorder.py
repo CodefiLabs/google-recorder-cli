@@ -141,9 +141,8 @@ class RecorderClient:
                     raise ValueError(f"Recording not found: {recording_id}")
 
                 # Step 2: navigate to the recording URL to trigger GetTranscription
-                # NOTE: GetTranscription may fire multiple times - we want the LARGEST response
-                # (small initial response ~4 bytes, then full 447KB response)
-                trans_future = _intercept_grpc(page, "GetTranscription", wait_for_largest=True)
+                # GetTranscription returns one 447KB response with all data
+                trans_future = _intercept_grpc(page, "GetTranscription")
                 await page.goto(f"{RECORDER_URL}/{audio_id}")
                 try:
                     data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
@@ -370,113 +369,90 @@ class RecorderClient:
     def _parse_transcript(self, recording_id: str, data: list) -> Transcript:
         """Parse GetTranscription response to official Pixel transcript format.
 
-        The GetTranscription response (447KB for a 73-min recording) contains:
-        - Full word-level data with speaker information in word[6]
-        - All the data needed to reconstruct the official speaker-labeled transcript
+        Actual structure (from 447KB response):
+        data[0] = list of 1013 sentence units (NOT nested arrays)
+        Each unit = [words[], sentence_speaker_int, sentence_field_str]
+        - unit[0] = FLAT list of 1-64 word objects
+        - unit[1] = int (possibly sentence-level speaker)
+        - unit[2] = str (sentence-level field, NOT iterable)
         
-        Response format: [[[segment, ...], ...]]
-        Each segment: [sentence, ...]
-        Each sentence: [word, ...]
-        Each word: [text, alt_display_text, start_ms_str, end_ms_str, ?, ?, [speaker_flags]]
+        Each word = [text, alt_display_text, start_ms, end_ms, null, null, [speaker_flags]]
+        - word[0] = raw token (always present)
+        - word[1] = display text with punctuation (or null) - PREFER THIS when present
+        - word[6] = [speaker_id, ?] where speaker_id: None/0=unlabeled, 1+=Speaker N
         
-        We reconstruct the official format:
-        - Initial text (possibly unlabeled before speaker detection)
-        - [Speaker 1] on separate line, then that speaker's text
-        - [Speaker 2] on separate line, then that speaker's text
-        - etc.
+        Official format: 1029 lines, one block per sentence unit, CRLF, speaker headers
         """
-        # First pass: extract all words with speaker information
-        words_with_speakers = []
-        try:
-            for segment in data[0]:
-                for sentence in segment:
-                    for word in sentence:
-                        try:
-                            text = str(word[0])
-                            start_ms = int(word[2])
-                            # Extract speaker info from word[6] (speaker_flags array)
-                            # Format: [0, 2] where first element is speaker ID (0 = unlabeled, 1+ = Speaker N)
-                            speaker_id = None
-                            if len(word) > 6 and word[6]:
-                                if isinstance(word[6], list) and len(word[6]) > 0:
-                                    # speaker_flags[0] is the speaker ID
-                                    # 0 or None = unlabeled, 1+ = Speaker N
-                                    raw_id = word[6][0]
-                                    if raw_id and raw_id > 0:
-                                        speaker_id = raw_id
-                            
-                            words_with_speakers.append({
-                                'text': text,
-                                'start_ms': start_ms,
-                                'speaker_id': speaker_id,
-                            })
-                        except (IndexError, TypeError, ValueError):
-                            continue
-        except (IndexError, TypeError):
-            pass
-
-        if not words_with_speakers:
-            return Transcript(recording_id=recording_id, full_text="", segments=[])
-
-        # Second pass: group into speaker turns and format like official transcript
-        lines = []  # Will build the official format line by line
+        lines = []
         segments = []
         current_speaker = None
-        current_words = []
         
-        for word_info in words_with_speakers:
-            word_text = word_info['text']
-            speaker_id = word_info['speaker_id']
-            
-            # Detect speaker change
-            if speaker_id != current_speaker:
-                # Save previous segment if any
-                if current_words:
-                    text = ' '.join(current_words)
-                    if current_speaker is not None:
-                        # This was a labeled speaker turn
-                        lines.append('')  # Blank line before speaker label
-                        lines.append(f'[Speaker {current_speaker}]')
-                        lines.append(text)
-                        segments.append(TranscriptSegment(
-                            timestamp_seconds=0.0,
-                            speaker=f'Speaker {current_speaker}',
-                            text=text,
-                        ))
-                    else:
-                        # Initial unlabeled text
-                        lines.append(text)
-                        segments.append(TranscriptSegment(
-                            timestamp_seconds=0.0,
-                            speaker=None,
-                            text=text,
-                        ))
-                    current_words = []
+        try:
+            # Walk sentence units (1013 units in Joel recording)
+            for unit in data[0]:
+                if not isinstance(unit, list) or len(unit) < 1:
+                    continue
                 
-                # Start new speaker turn
-                current_speaker = speaker_id
-            
-            current_words.append(word_text)
+                # unit[0] is the flat list of word objects
+                words = unit[0]
+                if not isinstance(words, list):
+                    continue
+                
+                # Extract words and determine speaker for this sentence unit
+                sentence_words = []
+                sentence_speaker = None
+                
+                for word in words:
+                    if not isinstance(word, list) or len(word) < 7:
+                        continue
+                    
+                    # Prefer word[1] (display text with punctuation) over word[0] (raw token)
+                    text = word[1] if word[1] else word[0]
+                    if not text:
+                        continue
+                    
+                    sentence_words.append(str(text))
+                    
+                    # Extract speaker from word[6] speaker_flags
+                    if word[6] and isinstance(word[6], list) and len(word[6]) > 0:
+                        raw_id = word[6][0]
+                        if raw_id and raw_id > 0:
+                            sentence_speaker = raw_id
+                
+                if not sentence_words:
+                    continue
+                
+                # Join words with spaces for this sentence
+                sentence_text = ' '.join(sentence_words)
+                
+                # Detect speaker change
+                if sentence_speaker != current_speaker:
+                    # Add header for new speaker (if labeled)
+                    if sentence_speaker is not None:
+                        lines.append('')  # Blank line
+                        lines.append(f'[Speaker {sentence_speaker}]')
+                    
+                    current_speaker = sentence_speaker
+                
+                # Add sentence text
+                lines.append(sentence_text)
+                
+                # Create segment (group consecutive sentences by speaker for segments)
+                if not segments or segments[-1].speaker != (f'Speaker {current_speaker}' if current_speaker else None):
+                    segments.append(TranscriptSegment(
+                        timestamp_seconds=0.0,
+                        speaker=f'Speaker {current_speaker}' if current_speaker else None,
+                        text=sentence_text,
+                    ))
+                else:
+                    # Same speaker, append to last segment
+                    segments[-1].text += ' ' + sentence_text
         
-        # Save final segment
-        if current_words:
-            text = ' '.join(current_words)
-            if current_speaker is not None:
-                lines.append('')
-                lines.append(f'[Speaker {current_speaker}]')
-                lines.append(text)
-                segments.append(TranscriptSegment(
-                    timestamp_seconds=0.0,
-                    speaker=f'Speaker {current_speaker}',
-                    text=text,
-                ))
-            else:
-                lines.append(text)
-                segments.append(TranscriptSegment(
-                    timestamp_seconds=0.0,
-                    speaker=None,
-                    text=text,
-                ))
+        except (IndexError, TypeError) as e:
+            pass
+
+        if not lines:
+            return Transcript(recording_id=recording_id, full_text="", segments=[])
         
         # Join with CRLF (Windows line endings) to match official file
         full_text = '\r\n'.join(lines)

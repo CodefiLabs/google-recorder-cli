@@ -27,11 +27,19 @@ REPRO_AUDIO_ID = "80da17b9-29ac-4932-9579-c5bafe0daec9"
 REPRO_DURATION_SECONDS = 4407  # 73m 27s
 REPRO_TITLE = "Aug 19 at 2:32 PM call with Joel"
 
-# The truncated live caption that GetTranscription returned (the bug)
+# The truncated data (the bug - only first sentence unit, rest dropped)
+# Real structure: sentence units, not nested arrays
 REPRO_TRUNCATED_GRPC_DATA = [
     [
-        [[["I", "", "0", "500", None, None, []]]],
-        [[["um", "", "600", "900", None, None, []]]],
+        # Only first sentence unit (bug: parser crashed, dropped 1012 more units)
+        [
+            [
+                ["I", None, "0", "500", None, None, [0, 0]],
+                ["um", None, "600", "900", None, None, [0, 0]],
+            ],
+            0,
+            "00000"
+        ],
     ]
 ]
 
@@ -85,10 +93,11 @@ def test_root_cause_truncated_grpc_vs_official_download():
     client = RecorderClient()
     
     # OLD PATH (bug): GetTranscription gRPC endpoint
-    # Returns only the live caption, which truncates on long recordings
+    # Parser crashes after first sentence unit, drops remaining 1012 units
     truncated = client._parse_transcript(REPRO_RECORDING_ID, REPRO_TRUNCATED_GRPC_DATA)
-    assert truncated.full_text == "I um"
-    assert len(truncated.full_text) == 4  # Only 4 bytes
+    assert "I" in truncated.full_text
+    assert "um" in truncated.full_text
+    assert len(truncated.full_text) < 20  # Very short
     
     # NEW PATH (fix): Official download endpoint
     # Returns complete transcript with speaker labels

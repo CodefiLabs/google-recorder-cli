@@ -46,36 +46,63 @@ Perfect. Keep me updated on any blockers.
 
 Transcribed by Pixel"""
 
-# GetTranscription format - word arrays with speaker info in word[6]
-# Format: [text, alt_text, start_ms, end_ms, ?, ?, [speaker_flags]]
-# speaker_flags[0] contains the speaker ID (or None/0 for unlabeled)
+# GetTranscription ACTUAL format (from 447KB response schema):
+# data[0] = list of sentence units (1013 units for 73-min recording)
+# Each unit = [words[], sentence_int, sentence_str] (always len=3)
+#   unit[0] = flat list of word objects (1-64 words)
+#   unit[1] = int (sentence-level field, NOT iterable)
+#   unit[2] = str (sentence-level field, NOT iterable)
+# 
+# Each word = [text, alt_display, start_ms, end_ms, null, null, [speaker_flags]]
+#   word[0] = raw token
+#   word[1] = display text with punctuation (or null) - PREFER when present
+#   word[6] = [speaker_id, ?] where 0/None=unlabeled, 1+=Speaker N
 
-# Small example showing the format
 SIMPLE_GET_TRANSCRIPTION_DATA = [
     [
-        # Initial words without speaker (speaker_id = None or 0)
-        [[
-            ["I,", "", "0", "200", None, None, []],
-            ["um.", "", "300", "500", None, None, []],
-        ]],
-        # Words from speaker 1
-        [[
-            ["Hello", "", "1000", "1200", None, None, [1]],
-            ["there", "", "1300", "1500", None, None, [1]],
-        ]],
-        # Words from speaker 2
-        [[
-            ["Hi", "", "2000", "2100", None, None, [2]],
-            ["back", "", "2200", "2300", None, None, [2]],
-        ]],
+        # Sentence unit 1: Initial unlabeled text
+        [
+            [
+                ["I", "I,", "0", "200", None, None, [0, 0]],
+                ["um", "um.", "300", "500", None, None, [0, 0]],
+            ],
+            0,  # sentence int
+            "00000"  # sentence str
+        ],
+        # Sentence unit 2: Speaker 1
+        [
+            [
+                ["Hello", "Hello", "1000", "1200", None, None, [1, 2]],
+                ["there", "there", "1300", "1500", None, None, [1, 2]],
+            ],
+            1,
+            "00001"
+        ],
+        # Sentence unit 3: Speaker 2
+        [
+            [
+                ["Hi", "Hi", "2000", "2100", None, None, [2, 1]],
+                ["back", "back", "2200", "2300", None, None, [2, 1]],
+            ],
+            2,
+            "00002"
+        ],
     ]
 ]
 
-# Truncated version (only first 2 words) - simulates old bug
+# Truncated version (only first sentence unit) - simulates old bug where
+# parser crashed after first unit and dropped remaining 1012 units
 TRUNCATED_LIVE_CAPTION_DATA = [
     [
-        [[["I", "", "0", "200", None, None, []]]],
-        [[["um", "", "300", "500", None, None, []]]],
+        # Only first sentence unit (the bug: parser crashes on unit[1]/unit[2])
+        [
+            [
+                ["I", None, "0", "200", None, None, [0, 0]],
+                ["um", None, "300", "500", None, None, [0, 0]],
+            ],
+            0,
+            "00000"
+        ],
     ]
 ]
 
