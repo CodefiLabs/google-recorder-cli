@@ -102,11 +102,13 @@ class RecorderClient:
         """
         Fetch the official full transcript for a recording.
 
-        This method intercepts the GetTranscription gRPC response (447KB for a 73-min recording)
-        and reconstructs the official speaker-labeled Pixel transcript format that matches
-        what the web UI's Download button produces (50KB text file with speaker labels).
+        This method intercepts the GetTranscription gRPC response and waits for the largest
+        payload (447KB for a 73-min recording), then reconstructs the official speaker-labeled 
+        Pixel transcript format that matches what the web UI's Download button produces 
+        (50KB text file with speaker labels).
 
-        The GetTranscription response contains all word-level data with speaker information
+        GetTranscription may send multiple responses. This method collects them and selects
+        the largest one, which contains the full word-level data with speaker information
         in word[6]. The parser extracts speaker IDs, groups words by speaker turn, and
         formats the output to match the official transcript:
         - Initial text (possibly unlabeled before speaker detection)
@@ -141,8 +143,8 @@ class RecorderClient:
                     raise ValueError(f"Recording not found: {recording_id}")
 
                 # Step 2: navigate to the recording URL to trigger GetTranscription
-                # GetTranscription returns one 447KB response with all data
-                trans_future = _intercept_grpc(page, "GetTranscription")
+                # GetTranscription may send multiple responses; wait for the largest (447KB)
+                trans_future = _intercept_grpc(page, "GetTranscription", wait_for_largest=True)
                 await page.goto(f"{RECORDER_URL}/{audio_id}")
                 try:
                     data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
