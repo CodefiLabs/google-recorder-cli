@@ -44,7 +44,7 @@ Saves the transcript as `<output>/<id>.txt`.
 ```
 recorder transcript <id> -o ~/docs/     # -o defaults to "."
 ```
-Fails if the recording has no transcript yet (`has_transcript: false` in `list` output) — check that first. **Can also silently return a truncated transcript on longer recordings — see Gotchas.**
+Fails if the recording has no transcript yet (`has_transcript: false` in `list` output) — check that first. Returns the official full transcript with speaker labels (e.g. `[Speaker 1]`), not the truncated live caption.
 
 ### `recorder download <id>`
 Saves audio as `<output>/<sanitized title>.m4a` (named by title, not id).
@@ -66,11 +66,7 @@ recorder sync -o ~/recorder-backup/     # -o defaults to "./recorder-backup"
 
 ## Gotchas
 
-**`get_transcript` (MCP) and `recorder transcript` (CLI) can silently return a truncated transcript.** Both pull Google Recorder's on-device live transcript — generated in real time on the Pixel while recording, optimized for speed over completeness. On longer recordings it can lose confidence partway through and stop, dropping everything after with no error, warning, or a "partial" flag — the output just looks like a complete, short transcript.
-
-Tell by comparing transcript length to `duration_seconds` (from `list`/`info`): normal speech runs ~2 words/sec, so a transcript running far short of `duration_seconds × 2` words is suspect. (Observed case: a 184s recording, 17-word transcript — about 1 word per 11s.) Skip the check on short recordings (a few seconds, a handful of words) — the live transcript is fine there.
-
-**Fix:** `recorder download <id>` for the raw `.m4a`, then transcribe it locally with a real STT model (e.g. `mlx_whisper`, `large-v3-turbo`) instead of trusting the on-device transcript. This bypasses the live transcript entirely and gets the full content.
+**Transcript format:** `get_transcript` (MCP) and `recorder transcript` (CLI) now return the official full transcript from Google's download endpoint, which includes speaker labels (e.g. `[Speaker 1]`, `[Speaker 2]`) and is always complete, even for long recordings. This is the same transcript that the web UI's "Download" button provides. The footer "Transcribed by Pixel" is automatically stripped.
 
 ## Errors you may see
 

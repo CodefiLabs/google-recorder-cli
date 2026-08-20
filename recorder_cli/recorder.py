@@ -14,28 +14,66 @@ _GRPC_BASE = (
 _AUDIO_BASE = "https://usercontent.recorder.google.com/download/playback"
 
 
-def _intercept_grpc(page, endpoint: str) -> asyncio.Future:
+def _intercept_grpc(page, endpoint: str, wait_for_largest: bool = False) -> asyncio.Future:
     """
-    Register a one-shot response interceptor for a gRPC endpoint.
-    Returns a Future that resolves with the parsed JSON body of the first matching response.
+    Register a response interceptor for a gRPC endpoint.
+    
+    Args:
+        page: Playwright page object
+        endpoint: Endpoint name to match (e.g., "GetTranscription")
+        wait_for_largest: If True, collect all responses and return the largest one
+                         (useful for GetTranscription which may send small then large payloads)
+    
+    Returns a Future that resolves with the parsed JSON body.
     The listener is automatically removed once the future resolves.
     """
     loop = asyncio.get_event_loop()
     future: asyncio.Future = loop.create_future()
 
-    def on_response(response: object) -> None:
-        if endpoint in response.url and not future.done():  # type: ignore[attr-defined]
-            async def _read() -> None:
-                try:
-                    data = await response.json()  # type: ignore[attr-defined]
-                    if not future.done():
-                        future.set_result(data)
-                except Exception:
-                    pass
-            asyncio.ensure_future(_read())
+    if not wait_for_largest:
+        # Original one-shot behavior: return first response
+        def on_response(response: object) -> None:
+            if endpoint in response.url and not future.done():  # type: ignore[attr-defined]
+                async def _read() -> None:
+                    try:
+                        data = await response.json()  # type: ignore[attr-defined]
+                        if not future.done():
+                            future.set_result(data)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_read())
 
-    page.on("response", on_response)
-    future.add_done_callback(lambda _: page.remove_listener("response", on_response))
+        page.on("response", on_response)
+        future.add_done_callback(lambda _: page.remove_listener("response", on_response))
+    else:
+        # Collect all responses and return the largest
+        responses = []
+        
+        def on_response(response: object) -> None:
+            if endpoint in response.url:  # type: ignore[attr-defined]
+                async def _read() -> None:
+                    try:
+                        data = await response.json()  # type: ignore[attr-defined]
+                        responses.append(data)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_read())
+        
+        page.on("response", on_response)
+        
+        # Set up cleanup - after a delay, pick the largest response
+        async def _resolve_largest():
+            # Wait a bit for all responses to arrive
+            await asyncio.sleep(3)
+            if responses and not future.done():
+                # Return the largest response (by JSON string length)
+                import json
+                largest = max(responses, key=lambda r: len(json.dumps(r)))
+                future.set_result(largest)
+                page.remove_listener("response", on_response)
+        
+        asyncio.ensure_future(_resolve_largest())
+    
     return future
 
 
@@ -62,11 +100,25 @@ class RecorderClient:
 
     async def get_transcript(self, recording_id: str) -> Transcript:
         """
-        Fetch transcript for a recording.
+        Fetch the official full transcript for a recording.
 
-        The app URLs use audio_id (not recording_id), so we:
-        1. Load the main page to get the recording list (and find audio_id)
-        2. Navigate to RECORDER_URL/{audio_id} which auto-triggers GetTranscription
+        This method intercepts the GetTranscription gRPC response and waits for the largest
+        payload (447KB for a 73-min recording), then reconstructs the official speaker-labeled 
+        Pixel transcript format that matches what the web UI's Download button produces 
+        (50KB text file with speaker labels).
+
+        GetTranscription may send multiple responses. This method collects them and selects
+        the largest one, which contains the full word-level data with speaker information
+        in word[6]. The parser extracts speaker IDs, groups words by speaker turn, and
+        formats the output to match the official transcript:
+        - Initial text (possibly unlabeled before speaker detection)
+        - [Speaker 1] on its own line, then that speaker's text
+        - [Speaker 2] on its own line, then that speaker's text
+        - etc.
+        - CRLF line endings (Windows format)
+
+        The web UI uses this same GetTranscription response to build the client-side blob
+        that gets downloaded as "Recording Name.txt".
         """
         async with async_playwright() as p:
             context = await create_context(p)
@@ -91,7 +143,8 @@ class RecorderClient:
                     raise ValueError(f"Recording not found: {recording_id}")
 
                 # Step 2: navigate to the recording URL to trigger GetTranscription
-                trans_future = _intercept_grpc(page, "GetTranscription")
+                # GetTranscription may send multiple responses; wait for the largest (447KB)
+                trans_future = _intercept_grpc(page, "GetTranscription", wait_for_largest=True)
                 await page.goto(f"{RECORDER_URL}/{audio_id}")
                 try:
                     data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
@@ -216,33 +269,253 @@ class RecorderClient:
                 continue
         return recordings
 
-    def _parse_transcript(self, recording_id: str, data: list) -> Transcript:
-        """Parse GetTranscription response.
+    def _parse_official_transcript_text(self, recording_id: str, text: str) -> Transcript:
+        """Parse official transcript download (plain text with speaker labels).
 
-        Response format: [[[segment, ...], ...]]
-        Each segment: [sentence, ...]
-        Each sentence: [word, ...]
-        Each word: [text, alt_display_text, start_ms_str, end_ms_str, ?, ?, [speaker_flags]]
+        Format (based on real Pixel transcript file):
+            Initial text (possibly unlabeled)
+            
+            [Speaker 1]
+            Text from speaker 1...
+            
+            [Speaker 2]
+            Text from speaker 2...
+            ...
+            Transcribed by Pixel
+        
+        The first few lines may appear before any speaker label. Speaker labels are
+        preserved in the full_text. The footer is stripped. Segments are created per
+        speaker turn (timestamp info not available in official format).
         """
+        # Remove the "Transcribed by Pixel" footer if present
+        footer = "Transcribed by Pixel"
+        if text.strip().endswith(footer):
+            text = text[:-len(footer)].strip()
+
+        # Split into segments by speaker labels
+        import re
         segments = []
+        # Pattern matches [Speaker N] on its own line
+        pattern = r'^\[Speaker (\d+)\]$'
+        
+        lines = text.split('\n')
+        current_speaker = None
+        current_text = []
+        initial_text = []  # Text before first speaker label
+        found_first_speaker = False
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check if this line is a speaker label
+            speaker_match = re.match(pattern, line)
+            if speaker_match:
+                # Save previous segment if any
+                if current_speaker and current_text:
+                    segments.append(TranscriptSegment(
+                        timestamp_seconds=0.0,
+                        speaker=current_speaker,
+                        text=' '.join(current_text),
+                    ))
+                    current_text = []
+                elif not found_first_speaker and initial_text:
+                    # Save initial unlabeled text as a segment
+                    segments.append(TranscriptSegment(
+                        timestamp_seconds=0.0,
+                        speaker=None,
+                        text=' '.join(initial_text),
+                    ))
+                    initial_text = []
+                
+                # Start new speaker
+                current_speaker = f"Speaker {speaker_match.group(1)}"
+                found_first_speaker = True
+            else:
+                # This is text content
+                if found_first_speaker:
+                    current_text.append(line)
+                else:
+                    initial_text.append(line)
+        
+        # Save final segment
+        if current_speaker and current_text:
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=current_speaker,
+                text=' '.join(current_text),
+            ))
+        elif not found_first_speaker and initial_text:
+            # Only unlabeled text, no speakers
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=None,
+                text=' '.join(initial_text),
+            ))
+        
+        # If no segments at all, treat entire text as one segment
+        if not segments:
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=None,
+                text=text,
+            ))
+
+        return Transcript(
+            recording_id=recording_id,
+            full_text=text,
+            segments=segments,
+        )
+
+    def _parse_transcript(self, recording_id: str, data: list) -> Transcript:
+        """Parse GetTranscription response to official Pixel transcript format.
+
+        Actual structure (from 447KB response, live schema):
+        data[0] = list of 1013 sentence units
+        Each unit = [words[], int(0), str5] — always length 3
+        - unit[0] = FLAT list of word objects
+        - unit[1] = always 0 (not speaker)
+        - unit[2] = always same 5-char BCP-47-like string (not iterable)
+        
+        Each word = [text, alt_display_text, start_ms, end_ms, null, null, [flag, speaker_id]]
+        - word[0] = raw token (always present)
+        - word[1] = display text with punctuation (or null) - PREFER THIS when present
+                    179 word[1] values start with '\\n' (embedded line breaks)
+        - word[6] = [flag0, speaker_id] where:
+                    flag0: 0 or 1 (not speaker - distribution {0:8370, 1:199})
+                    speaker_id at INDEX 1: 0=unlabeled, 1-7=Speaker N
+                    Distribution: {0:9, 1:5122, 2:3209, 3:86, 4:18, 5:33, 6:46, 7:46}
+        
+        Official format to match:
+        - 50970 bytes, CRLF line endings
+        - 343 [Speaker N] headers (emitted at start of each paragraph, even for same speaker)
+        - 179 paragraph breaks (word[1] starting with '\\n')
+        - First paragraph unlabeled (first 9 words have speaker_id 0)
+        - First letter after each [Speaker N] header is capitalized
+        - SHA256: 2dcfdf2314a0b821b5743fda92e8d9aaed02c885187c7c2099aabe062f6874b5
+        """
+        output_lines = []
+        segments = []
+        current_speaker = None
+        current_line = []
+        current_segment_text = []
+        capitalize_next = False  # Track if we need to capitalize the next word
+        
         try:
-            for segment in data[0]:
-                for sentence in segment:
-                    for word in sentence:
-                        try:
-                            text = str(word[0])
-                            start_ms = int(word[2])
+            # Walk all sentence units (1013 units in Joel recording)
+            for unit in data[0]:
+                if not isinstance(unit, list) or len(unit) < 1:
+                    continue
+                
+                # unit[0] is the flat list of word objects
+                words = unit[0]
+                if not isinstance(words, list):
+                    continue
+                
+                # Process each word in this unit
+                for word in words:
+                    if not isinstance(word, list) or len(word) < 7:
+                        continue
+                    
+                    # Prefer word[1] (display text with punctuation) over word[0] (raw token)
+                    text = word[1] if word[1] else word[0]
+                    if not text:
+                        continue
+                    
+                    text = str(text)
+                    
+                    # Extract speaker from word[6][1] (NOT word[6][0] which is a flag)
+                    word_speaker = 0  # Default: unlabeled
+                    if word[6] and isinstance(word[6], list) and len(word[6]) > 1:
+                        speaker_id = word[6][1]
+                        if speaker_id is not None:
+                            word_speaker = speaker_id
+                    
+                    # Detect speaker change - emit header
+                    if word_speaker != current_speaker:
+                        # Flush current line
+                        if current_line:
+                            line_text = ' '.join(current_line)
+                            output_lines.append(line_text)
+                            current_segment_text.append(line_text)
+                            current_line = []
+                        
+                        # Save previous segment
+                        if current_segment_text:
                             segments.append(TranscriptSegment(
-                                timestamp_seconds=start_ms / 1000.0,
-                                speaker=None,
-                                text=text,
+                                timestamp_seconds=0.0,
+                                speaker=f'Speaker {current_speaker}' if current_speaker and current_speaker > 0 else None,
+                                text=' '.join(current_segment_text),
                             ))
-                        except (IndexError, TypeError, ValueError):
-                            continue
-        except (IndexError, TypeError):
+                            current_segment_text = []
+                        
+                        # Emit speaker header (skip for unlabeled speaker_id 0)
+                        if word_speaker > 0:
+                            output_lines.append('')  # Blank line
+                            output_lines.append(f'[Speaker {word_speaker}]')
+                            capitalize_next = True  # Capitalize first word after header
+                        
+                        current_speaker = word_speaker
+                    
+                    # Handle embedded newlines in word[1] (179 cases = paragraph breaks)
+                    # Official format: emit [Speaker N] at START of each paragraph
+                    if text.startswith('\n'):
+                        # Flush current line before paragraph break
+                        if current_line:
+                            line_text = ' '.join(current_line)
+                            output_lines.append(line_text)
+                            current_segment_text.append(line_text)
+                            current_line = []
+                        
+                        # Emit blank line + speaker header for NEW paragraph
+                        # BUT: Skip if we just emitted this exact header (dedup consecutive headers)
+                        # This happens when speaker change AND paragraph break occur on same word
+                        expected_header = f'[Speaker {word_speaker}]'
+                        last_line = output_lines[-1] if output_lines else None
+                        
+                        if word_speaker > 0 and last_line != expected_header:
+                            output_lines.append('')  # Blank line
+                            output_lines.append(expected_header)
+                            capitalize_next = True  # Capitalize first word after header
+                        
+                        # Continue with text after the newline
+                        text = text[1:]
+                    
+                    # Capitalize first alphabetic character if we just emitted a speaker header
+                    if text and capitalize_next:
+                        # Find first alphabetic character and capitalize it
+                        for i, char in enumerate(text):
+                            if char.isalpha():
+                                text = text[:i] + char.upper() + text[i+1:]
+                                capitalize_next = False
+                                break
+                    
+                    if text:
+                        current_line.append(text)
+        
+        except (IndexError, TypeError) as e:
             pass
 
-        full_text = " ".join(s.text for s in segments).strip()
+        # Flush final line and segment
+        if current_line:
+            line_text = ' '.join(current_line)
+            output_lines.append(line_text)
+            current_segment_text.append(line_text)
+        
+        if current_segment_text:
+            segments.append(TranscriptSegment(
+                timestamp_seconds=0.0,
+                speaker=f'Speaker {current_speaker}' if current_speaker and current_speaker > 0 else None,
+                text=' '.join(current_segment_text),
+            ))
+        
+        if not output_lines:
+            return Transcript(recording_id=recording_id, full_text="", segments=[])
+        
+        # Join with CRLF (Windows line endings)
+        full_text = '\r\n'.join(output_lines)
+        
         return Transcript(
             recording_id=recording_id,
             full_text=full_text,
