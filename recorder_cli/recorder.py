@@ -46,34 +46,120 @@ def _intercept_grpc(page, endpoint: str, wait_for_largest: bool = False) -> asyn
         page.on("response", on_response)
         future.add_done_callback(lambda _: page.remove_listener("response", on_response))
     else:
-        # Collect all responses and return the largest
+        # Collect all responses and return the largest.
+        # The endpoint sends a small payload first, then a larger full one, so we
+        # resolve only after a quiet SETTLE_SECONDS gap with no new arrivals --
+        # measured from the LAST arrival, not from registration. A fixed delay
+        # measured from registration silently loses the race whenever the page
+        # takes longer than that to issue the call (cold profile, slow network),
+        # leaving the future unresolved until the caller's own timeout fires.
         responses = []
-        
+        last_arrival: float | None = None
+        SETTLE_SECONDS = 3.0
+        POLL_SECONDS = 0.25
+
         def on_response(response: object) -> None:
             if endpoint in response.url:  # type: ignore[attr-defined]
                 async def _read() -> None:
+                    nonlocal last_arrival
                     try:
                         data = await response.json()  # type: ignore[attr-defined]
                         responses.append(data)
+                        last_arrival = loop.time()
                     except Exception:
                         pass
                 asyncio.ensure_future(_read())
-        
+
         page.on("response", on_response)
-        
-        # Set up cleanup - after a delay, pick the largest response
-        async def _resolve_largest():
-            # Wait a bit for all responses to arrive
-            await asyncio.sleep(3)
-            if responses and not future.done():
-                # Return the largest response (by JSON string length)
-                import json
-                largest = max(responses, key=lambda r: len(json.dumps(r)))
-                future.set_result(largest)
-                page.remove_listener("response", on_response)
-        
+
+        async def _resolve_largest() -> None:
+            # Poll until the payloads stop arriving. Never gives up on its own --
+            # the caller's asyncio.wait_for supplies the deadline.
+            while not future.done():
+                await asyncio.sleep(POLL_SECONDS)
+                if last_arrival is None:
+                    continue
+                if loop.time() - last_arrival < SETTLE_SECONDS:
+                    continue
+                if responses and not future.done():
+                    import json
+                    largest = max(responses, key=lambda r: len(json.dumps(r)))
+                    future.set_result(largest)
+                    page.remove_listener("response", on_response)
+                return
+
         asyncio.ensure_future(_resolve_largest())
     
+    return future
+
+
+def _intercept_grpc_pages(page, endpoint: str, settle_seconds: float = 3.0) -> asyncio.Future:
+    """
+    Collect EVERY response for a paginated gRPC endpoint and merge their item lists.
+
+    The recorder web app requests its recording list one page at a time (10 per
+    page), so intercepting a single response silently yields only the newest page.
+    Anything older is invisible -- it cannot be listed, and because the other
+    commands resolve a recording's audio_id through this same list, it also cannot
+    have its transcript, audio, or metadata fetched ("Recording not found").
+
+    Resolves with the merged ``[[items...], token]`` shape the parsers already
+    expect, deduped by recording id and keeping first-seen (newest-first) order.
+    """
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future = loop.create_future()
+
+    merged: list = []
+    seen: set = set()
+    token = None
+    last_arrival: float | None = None
+
+    def on_response(response: object) -> None:
+        if endpoint not in response.url:  # type: ignore[attr-defined]
+            return
+
+        async def _read() -> None:
+            nonlocal last_arrival, token
+            try:
+                data = await response.json()  # type: ignore[attr-defined]
+                items = data[0]
+            except Exception:
+                return
+            if not isinstance(items, list):
+                return
+            for item in items:
+                try:
+                    rid = item[0]
+                except (IndexError, TypeError):
+                    continue
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                merged.append(item)
+            if len(data) > 1:
+                token = data[1]
+            last_arrival = loop.time()
+
+        asyncio.ensure_future(_read())
+
+    page.on("response", on_response)
+
+    async def _resolve_when_settled() -> None:
+        # Pages trickle in; resolve once none have arrived for settle_seconds.
+        # The caller's asyncio.wait_for supplies the overall deadline.
+        while not future.done():
+            await asyncio.sleep(0.25)
+            if last_arrival is None:
+                continue
+            if loop.time() - last_arrival < settle_seconds:
+                continue
+            if not future.done():
+                future.set_result([merged, token])
+                page.remove_listener("response", on_response)
+            return
+
+    asyncio.ensure_future(_resolve_when_settled())
+
     return future
 
 
@@ -86,10 +172,10 @@ class RecorderClient:
             context = await create_context(p)
             page = await context.new_page()
             try:
-                future = _intercept_grpc(page, "GetRecordingList")
+                future = _intercept_grpc_pages(page, "GetRecordingList")
                 await page.goto(RECORDER_URL)
                 try:
-                    data = await asyncio.wait_for(asyncio.shield(future), timeout=30)
+                    data = await asyncio.wait_for(asyncio.shield(future), timeout=60)
                 except asyncio.TimeoutError:
                     raise TimeoutError(
                         "Recorder did not load. Session may be expired. Run: recorder login"
@@ -125,10 +211,10 @@ class RecorderClient:
             page = await context.new_page()
             try:
                 # Step 1: get recording list to find audio_id
-                list_future = _intercept_grpc(page, "GetRecordingList")
+                list_future = _intercept_grpc_pages(page, "GetRecordingList")
                 await page.goto(RECORDER_URL)
                 try:
-                    list_data = await asyncio.wait_for(asyncio.shield(list_future), timeout=30)
+                    list_data = await asyncio.wait_for(asyncio.shield(list_future), timeout=60)
                 except asyncio.TimeoutError:
                     raise TimeoutError(
                         "Recorder did not load. Session may be expired. Run: recorder login"
@@ -147,11 +233,12 @@ class RecorderClient:
                 trans_future = _intercept_grpc(page, "GetTranscription", wait_for_largest=True)
                 await page.goto(f"{RECORDER_URL}/{audio_id}")
                 try:
-                    data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=30)
+                    data = await asyncio.wait_for(asyncio.shield(trans_future), timeout=60)
                 except asyncio.TimeoutError:
                     raise TimeoutError(
-                        f"Transcript not available for {recording_id}. "
-                        "The recording may not have a transcript yet."
+                        f"No GetTranscription payload for {recording_id} within 60s. "
+                        "The recording may have no transcript yet, or the page did not "
+                        "finish loading. Retrying usually succeeds."
                     )
                 return self._parse_transcript(recording_id, data)
             finally:
@@ -164,10 +251,10 @@ class RecorderClient:
             page = await context.new_page()
             try:
                 # Get recording list to find audio_id and title
-                list_future = _intercept_grpc(page, "GetRecordingList")
+                list_future = _intercept_grpc_pages(page, "GetRecordingList")
                 await page.goto(RECORDER_URL)
                 try:
-                    list_data = await asyncio.wait_for(asyncio.shield(list_future), timeout=30)
+                    list_data = await asyncio.wait_for(asyncio.shield(list_future), timeout=60)
                 except asyncio.TimeoutError:
                     raise TimeoutError(
                         "Recorder did not load. Session may be expired. Run: recorder login"
